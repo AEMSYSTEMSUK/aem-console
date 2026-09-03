@@ -42,7 +42,7 @@ export async function POST(req: NextRequest) {
     `d=${sq(domain)}; ` +
     `o=$(echo | timeout 8 openssl s_client -servername "$d" -connect ${sq(server.fqdn)}:443 2>&1); ` +
     `c=$(printf '%s' "$o" | openssl x509 -noout -issuer -startdate -enddate 2>/dev/null); ` +
-    `if [ -z "$c" ]; then for dir in "/var/www/vhosts/system/$d" "/var/www/vhosts/system/www.$d"; do f="$dir/conf/last_nginx.conf"; [ -f "$f" ] || continue; p=$(grep -hoE 'ssl_certificate[[:space:]]+[^;]+' "$f" | head -1 | awk '{print $2}'); if [ -n "$p" ] && [ -f "$p" ]; then c=$(openssl x509 -in "$p" -noout -issuer -startdate -enddate 2>/dev/null); [ -n "$c" ] && break; fi; done; fi; ` +
+    `if [ -z "$c" ]; then for dir in "/var/www/vhosts/system/$d" "/var/www/vhosts/system/www.$d"; do f="$dir/conf/last_nginx.conf"; [ -f "$f" ] || continue; p=$(grep -hoE 'ssl_certificate[[:space:]]+"?[^";]+' "$f" | head -1 | sed -E 's/^ssl_certificate[[:space:]]+"?//'); if [ -n "$p" ] && [ -f "$p" ]; then c=$(openssl x509 -in "$p" -noout -issuer -startdate -enddate 2>/dev/null); [ -n "$c" ] && break; fi; done; fi; ` +
     `printf '%s\\n' "$c"; ` +
     `if [ -z "$c" ]; then printf '%s' "$o" | grep -aioE 'connection refused|connection timed out|no route to host|network is unreachable|operation timed out|connect:errno=[0-9]+|timeout' | head -1; fi`;
   const res = await sshExec(server.fqdn, cmd, 30);
