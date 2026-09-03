@@ -10,8 +10,18 @@ git pull --ff-only origin main
 echo "==> [2/5] npm install"
 npm install --no-audit --no-fund
 
-# Load DB + app config so node-pg-migrate and the build have DATABASE_URL etc.
-set -a; [ -f /etc/aem-console/config.env ] && . /etc/aem-console/config.env; set +a
+# Load DB + app config so node-pg-migrate has DATABASE_URL etc. config.env is a systemd EnvironmentFile,
+# NOT guaranteed bash-source-safe, so parse KEY=VALUE lines ourselves and skip anything else.
+if [ -f /etc/aem-console/config.env ]; then
+  set +e
+  while IFS= read -r __line || [ -n "$__line" ]; do
+    case "$__line" in
+      ''|\#*) continue ;;
+      [A-Za-z_]*=*) export "$__line" 2>/dev/null || true ;;
+    esac
+  done < /etc/aem-console/config.env
+  set -e
+fi
 
 echo "==> [3/5] db migrate (node-pg-migrate)"
 npm run migrate:up || echo "   (migrate:up skipped/failed — apply manually if a new migration needs it)"
