@@ -1,0 +1,417 @@
+import { db } from '@/lib/db';
+import { sshExec } from '@/lib/ssh';
+import { encrypt } from '@/lib/crypto';
+import { spawn } from 'child_process';
+import { promises as dns } from 'dns';
+import { findZoneForDomain, upsertARecord, getCloudflareToken } from '@/lib/cloudflare';
+
+export interface WizardInput {
+  customer_name: string;
+  customer_contact_email: string;
+  staging_slug: string;
+  real_domain: string;
+}
+
+export interface StepDef {
+  number: number;
+  name: string;
+  role_required: 'admin' | 'web';
+}
+
+export const STEPS: StepDef[] = [
+  { number: 1,  name: 'Validate inputs', role_required: 'web' },
+  { number: 2,  name: 'Create <slug>.aemstaging.co.uk + install WP', role_required: 'web' },
+  { number: 3,  name: 'Notify support@aemsystems.co.uk', role_required: 'web' },
+  { number: 4,  name: 'Admin: create customer subscription on staging1', role_required: 'admin' },
+  { number: 5,  name: 'WP Toolkit clone staging slug -> real domain (staging1)', role_required: 'admin' },
+  { number: 6,  name: 'Transfer staging1 -> live1 (backup/scp/restore)', role_required: 'admin' },
+  { number: 7,  name: 'Cloudflare DNS A record (real domain -> live1 IP)', role_required: 'admin' },
+  { number: 8,  name: 'Plesk DNS template sync (live1)', role_required: 'admin' },
+  { number: 9,  name: "Let's Encrypt SSL (live1)", role_required: 'admin' },
+  { number: 10, name: 'WP search-replace residual URLs', role_required: 'admin' },
+  { number: 11, name: 'Customer mailbox creation', role_required: 'admin' },
+  { number: 12, name: 'Verify + schedule 7-day staging drop', role_required: 'admin' },
+];
+
+export interface WizardRow {
+  id: number;
+  customer_name: string;
+  customer_contact_email: string;
+  staging_slug: string;
+  real_domain: string;
+  target_live_server: string;
+  current_step: number;
+  status: string;
+  created_by_user_id: number;
+  created_at: string;
+  completed_at: string | null;
+  staging_drop_at: string | null;
+  staging_dropped_at: string | null;
+  notes: string | null;
+}
+
+export interface StepRow {
+  id: number;
+  wizard_id: number;
+  step_number: number;
+  step_name: string;
+  role_required: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  output: string | null;
+  error: string | null;
+}
+
+interface WpToolkitInstance {
+  id: number;
+  mainDomainId?: number;
+  path?: string;
+  siteUrl?: string;
+  fullPath?: string;
+  name?: string;
+}
+
+const STAGING1 = 'staging1.infra.aemsystems.co.uk';
+const LIVE1 = 'live1.infra.aemsystems.co.uk';
+const FLEET_KEY = '/etc/aem-console/keys/aem_fleet_id_ed25519';
+const KNOWN_HOSTS = '/etc/aem-console/keys/known_hosts';
+
+function genPassword(len = 20): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let pw = '';
+  for (let i = 0; i < len; i++) pw += chars[Math.floor(Math.random() * chars.length)];
+  return pw;
+}
+
+function genLogin(slug: string, suffix: string): string {
+  const safe = slug.replace(/[^a-z0-9]/g, '').slice(0, 20);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `${safe}_${suffix}_${rand}`;
+}
+
+function shellQ(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+async function sendMail(opts: { to: string; from: string; subject: string; body: string }): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('mail', ['-r', opts.from, '-s', opts.subject, opts.to]);
+    child.stdin.write(opts.body);
+    child.stdin.end();
+    let err = '';
+    child.stderr.on('data', d => err += d.toString());
+    child.on('exit', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`mail exit ${code}: ${err}`));
+    });
+    child.on('error', reject);
+  });
+}
+
+async function resolveServerIp(host: string): Promise<string> {
+  const ips = await dns.resolve4(host);
+  if (!ips.length) throw new Error(`Could not resolve IPv4 for ${host}`);
+  return ips[0];
+}
+
+async function streamFile(srcHost: string, srcPath: string, dstHost: string, dstPath: string): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const sshFrom = spawn('ssh', [
+      '-i', FLEET_KEY, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+      '-o', `UserKnownHostsFile=${KNOWN_HOSTS}`, `root@${srcHost}`, `cat ${srcPath}`,
+    ]);
+    const sshTo = spawn('ssh', [
+      '-i', FLEET_KEY, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+      '-o', `UserKnownHostsFile=${KNOWN_HOSTS}`, `root@${dstHost}`, `cat > ${dstPath}`,
+    ]);
+    sshFrom.stdout.pipe(sshTo.stdin);
+    let errFrom = '', errTo = '';
+    sshFrom.stderr.on('data', d => errFrom += d.toString());
+    sshTo.stderr.on('data', d => errTo += d.toString());
+    let exited = 0;
+    let codeFrom = -1, codeTo = -1;
+    const check = () => {
+      if (++exited === 2) {
+        if (codeFrom === 0 && codeTo === 0) resolve({ ok: true });
+        else resolve({ ok: false, error: `from(${codeFrom}): ${errFrom.slice(0, 800)}\nto(${codeTo}): ${errTo.slice(0, 800)}` });
+      }
+    };
+    sshFrom.on('exit', (c) => { codeFrom = c ?? -1; check(); });
+    sshTo.on('exit', (c) => { codeTo = c ?? -1; check(); });
+    setTimeout(() => { try { sshFrom.kill('SIGKILL'); sshTo.kill('SIGKILL'); } catch {} }, 600000);
+  });
+}
+
+async function lookupWpInstanceId(host: string, fqdn: string): Promise<{ id: number | null; error?: string }> {
+  const r = await sshExec(host, `plesk ext wp-toolkit --list -format json 2>&1`, 30);
+  if (!r.ok) return { id: null, error: `--list failed: ${r.stdout || r.stderr || r.error || 'unknown'}` };
+  try {
+    const instances = JSON.parse(r.stdout) as WpToolkitInstance[];
+    const target = instances.find(i =>
+      i.siteUrl === `https://${fqdn}` || i.siteUrl?.startsWith(`https://${fqdn}/`)
+    );
+    if (!target) return { id: null, error: `No instance found with siteUrl=https://${fqdn} in ${instances.length} instances` };
+    return { id: target.id };
+  } catch (e) {
+    return { id: null, error: `JSON parse error: ${(e as Error).message}\nRaw (500c): ${r.stdout.slice(0, 500)}` };
+  }
+}
+
+async function lookupDomainId(host: string, domain: string): Promise<{ id: number | null; error?: string }> {
+  const r = await sshExec(host, `plesk bin domain --info ${shellQ(domain)} 2>&1`, 30);
+  if (!r.ok) return { id: null, error: `domain info failed: ${r.stdout || r.stderr || r.error}` };
+  const m = r.stdout.match(/^id:\s*(\d+)/m);
+  if (!m) return { id: null, error: `Could not find 'id:' in plesk bin domain output. First 400c: ${r.stdout.slice(0, 400)}` };
+  return { id: parseInt(m[1], 10) };
+}
+
+export async function createWizard(input: WizardInput, createdByUserId: number): Promise<number> {
+  if (!/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/.test(input.staging_slug)) {
+    throw new Error('Invalid slug: lowercase letters/digits/hyphens, 3-64 chars, start/end alnum');
+  }
+  if (!/^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$/i.test(input.real_domain)) {
+    throw new Error('Invalid real domain');
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.customer_contact_email)) {
+    throw new Error('Invalid contact email');
+  }
+  if (!input.customer_name.trim()) throw new Error('Customer name required');
+
+  const r = await db.query<{ id: number }>(`
+    INSERT INTO onboarding_wizards
+      (customer_name, customer_contact_email, staging_slug, real_domain, target_live_server, current_step, status, created_by_user_id)
+    VALUES ($1, $2, $3, $4, 'live1', 1, 'in_progress', $5) RETURNING id
+  `, [input.customer_name.trim(), input.customer_contact_email.toLowerCase(),
+      input.staging_slug.toLowerCase(), input.real_domain.toLowerCase(), createdByUserId]);
+  const wizardId = r.rows[0].id;
+  for (const s of STEPS) {
+    await db.query(
+      `INSERT INTO onboarding_steps (wizard_id, step_number, step_name, role_required) VALUES ($1, $2, $3, $4)`,
+      [wizardId, s.number, s.name, s.role_required]);
+  }
+  return wizardId;
+}
+
+export async function getWizard(id: number): Promise<{ wizard: WizardRow; steps: StepRow[] } | null> {
+  const w = await db.query<WizardRow>('SELECT * FROM onboarding_wizards WHERE id = $1', [id]);
+  if (w.rows.length === 0) return null;
+  const s = await db.query<StepRow>('SELECT * FROM onboarding_steps WHERE wizard_id = $1 ORDER BY step_number', [id]);
+  return { wizard: w.rows[0], steps: s.rows };
+}
+
+interface StepResult { status: 'success' | 'failed'; output?: string; error?: string; }
+
+export async function runStep(wizardId: number, stepNumber: number): Promise<StepResult> {
+  const data = await getWizard(wizardId);
+  if (!data) throw new Error('Wizard not found');
+  const { wizard } = data;
+  await db.query(
+    `UPDATE onboarding_steps SET status='running', started_at=now(), error=NULL, output=NULL WHERE wizard_id=$1 AND step_number=$2`,
+    [wizardId, stepNumber]);
+  let result: StepResult;
+  try {
+    switch (stepNumber) {
+      case 1: result = {
+        status: 'success',
+        output: `Inputs OK.\n  slug='${wizard.staging_slug}' -> https://${wizard.staging_slug}.aemstaging.co.uk\n  real domain='${wizard.real_domain}'\n  customer email='${wizard.customer_contact_email}'`,
+      }; break;
+      case 2: result = await runStep2(wizard); break;
+      case 3: result = await runStep3(wizard); break;
+      case 4: result = await runStep4(wizard); break;
+      case 5: result = await runStep5(wizard); break;
+      case 6: result = await runStep6(wizard); break;
+      case 7: result = await runStep7(wizard); break;
+      default: result = { status: 'failed', error: 'Not implemented in Phase 2. Phase 3 = Steps 8-12.' };
+    }
+  } catch (e: unknown) {
+    result = { status: 'failed', error: (e as Error)?.message ?? String(e) };
+  }
+  await db.query(
+    `UPDATE onboarding_steps SET status=$1, output=$2, error=$3, completed_at=now() WHERE wizard_id=$4 AND step_number=$5`,
+    [result.status, result.output ?? null, result.error ?? null, wizardId, stepNumber]);
+  if (result.status === 'success') {
+    await db.query(`UPDATE onboarding_wizards SET current_step=$1 WHERE id=$2 AND current_step < $1`, [stepNumber + 1, wizardId]);
+    if (stepNumber === 12) {
+      await db.query(`UPDATE onboarding_wizards SET status='completed', completed_at=now(), staging_drop_at=now()+interval '7 days' WHERE id=$1`, [wizardId]);
+    }
+  }
+  return result;
+}
+
+async function runStep2(w: WizardRow): Promise<StepResult> {
+  const slug = w.staging_slug;
+  const fqdn = `${slug}.aemstaging.co.uk`;
+  const password = genPassword(20);
+  const title = `${w.customer_name} (staging)`.replace(/[^\w\s\-()]/g, '').slice(0, 50);
+  const r1 = await sshExec(STAGING1,
+    `plesk bin subdomain --create ${shellQ(slug)} -domain aemstaging.co.uk -www-root ${shellQ(slug)} -php true 2>&1`, 60);
+  if (!r1.ok) return { status: 'failed', error: `Subdomain create failed:\n${r1.stdout || r1.stderr || r1.error}` };
+  await new Promise(res => setTimeout(res, 2000));
+  const r2 = await sshExec(STAGING1,
+    `plesk ext wp-toolkit --install -domain-name ${shellQ(fqdn)} -path / -username admin -admin-email security@aemtech.co.uk -site-title ${shellQ(title)} -protocol https -language en_US 2>&1`, 180);
+  if (!r2.ok) return { status: 'failed', error: `wp-toolkit --install failed:\n${r2.stdout || r2.stderr || r2.error}` };
+  const lookup = await lookupWpInstanceId(STAGING1, fqdn);
+  let pwNote: string;
+  if (lookup.id === null) {
+    pwNote = `WARNING: Could not look up instance-id: ${lookup.error}`;
+  } else {
+    const r4 = await sshExec(STAGING1,
+      `plesk ext wp-toolkit --wp-cli -instance-id ${lookup.id} -- user update admin --user_pass=${shellQ(password)} 2>&1`, 60);
+    pwNote = r4.ok ? `Admin password set via wp-cli (instance-id ${lookup.id}).` : `WARNING: wp-cli password update failed:\n${r4.stdout || r4.stderr || r4.error}`;
+  }
+  return {
+    status: 'success',
+    output: `Created ${fqdn} + installed WP.\n\nSubdomain creation:\n${r1.stdout.slice(0, 500)}\n\nWP install (tail):\n${r2.stdout.slice(-800)}\n\nInstance id: ${lookup.id ?? 'NOT FOUND'}\n${pwNote}\n\nAdmin login:\n  URL:      https://${fqdn}/wp-admin\n  Username: admin\n  Password: ${password}`,
+  };
+}
+
+async function runStep3(w: WizardRow): Promise<StepResult> {
+  const subject = `[AEM Console] New customer onboarding: ${w.customer_name}`;
+  const body = `A new customer onboarding has been started by the web team.\n\nCustomer:        ${w.customer_name}\nContact email:   ${w.customer_contact_email}\nStaging URL:     https://${w.staging_slug}.aemstaging.co.uk\nReal domain:     ${w.real_domain}\nTarget server:   ${w.target_live_server}\nWizard ID:       ${w.id}\n\nWeb team has completed Steps 1-3 (staging WP install is live).\nNext: Andy or Lewis to take over Steps 4-12 (admin handover).\n\nConsole wizard:\n  https://bastion.infra.aemsystems.co.uk/onboarding/${w.id}\n\n-- AEM Console\n`;
+  await sendMail({ from: 'noreply@aemtech.co.uk', to: 'support@aemsystems.co.uk', subject, body });
+  return { status: 'success', output: 'Notification mail sent to support@aemsystems.co.uk' };
+}
+
+// =========================================================
+// Step 4: Create customer Plesk subscription on staging1
+// =========================================================
+async function runStep4(w: WizardRow): Promise<StepResult> {
+  const clientLogin = genLogin(w.staging_slug, 'c');
+  const clientPw = genPassword(24);
+  const sysLogin = genLogin(w.staging_slug, 's');
+  const sysPw = genPassword(24);
+  const cleanName = w.customer_name.replace(/'/g, '').slice(0, 60);
+
+  // Check if subscription with this domain already exists (idempotency)
+  const exists = await sshExec(STAGING1, `plesk bin domain --info ${shellQ(w.real_domain)} 2>&1 || true`, 30);
+  if (exists.ok && /^id:\s*\d+/m.test(exists.stdout)) {
+    return { status: 'failed', error: `Subscription for ${w.real_domain} already exists on staging1.\n${exists.stdout.slice(0, 500)}\nIf this is from a previous run, delete it manually in Plesk first.` };
+  }
+
+  // 4a. Create client
+  const r1 = await sshExec(STAGING1,
+    `plesk bin customer --create ${shellQ(clientLogin)} -name ${shellQ(cleanName)} -email ${shellQ(w.customer_contact_email)} -passwd ${shellQ(clientPw)} -company ${shellQ(cleanName)} 2>&1`, 60);
+  if (!r1.ok) return { status: 'failed', error: `Plesk client create failed:\n${r1.stdout || r1.stderr || r1.error}` };
+
+  // 4b. Create subscription
+  const r2 = await sshExec(STAGING1,
+    `plesk bin subscription --create ${shellQ(w.real_domain)} -owner ${shellQ(clientLogin)} -service-plan Unlimited -login ${shellQ(sysLogin)} -passwd ${shellQ(sysPw)} -ip 194.164.121.201 2>&1`, 90);
+  if (!r2.ok) return { status: 'failed', error: `Plesk subscription create failed:\n${r2.stdout || r2.stderr || r2.error}\n\nPartial state: client '${clientLogin}' was created but subscription failed.` };
+
+  return {
+    status: 'success',
+    output: `Customer Plesk subscription created on staging1.\n\nClient login:   ${clientLogin}\nClient password: ${clientPw}\nClient email:   ${w.customer_contact_email}\n\nSubscription:   ${w.real_domain}\nFTP/SSH user:   ${sysLogin}\nFTP/SSH pw:     ${sysPw}\n\nClient create output:\n${r1.stdout.slice(0, 400)}\n\nSubscription create output:\n${r2.stdout.slice(0, 400)}\n\nStore these credentials somewhere safe (they live in Plesk too).`,
+  };
+}
+
+// =========================================================
+// Step 5: WP Toolkit clone staging slug -> real domain on staging1
+// =========================================================
+async function runStep5(w: WizardRow): Promise<StepResult> {
+  const stagingFqdn = `${w.staging_slug}.aemstaging.co.uk`;
+  const source = await lookupWpInstanceId(STAGING1, stagingFqdn);
+  if (source.id === null) return { status: 'failed', error: `Could not find source instance for ${stagingFqdn}: ${source.error}` };
+
+  const r = await sshExec(STAGING1,
+    `plesk ext wp-toolkit --clone -source-instance-id ${source.id} -target-domain-name ${shellQ(w.real_domain)} -target-path / -force-overwrite no -format raw 2>&1`, 240);
+  if (!r.ok) return { status: 'failed', error: `wp-toolkit --clone failed:\n${r.stdout || r.stderr || r.error}` };
+
+  // Look up the new cloned instance
+  const cloned = await lookupWpInstanceId(STAGING1, w.real_domain);
+
+  return {
+    status: 'success',
+    output: `Cloned WP: ${stagingFqdn} (instance ${source.id}) -> ${w.real_domain} (instance ${cloned.id ?? 'lookup failed'})\n\nClone output (tail):\n${r.stdout.slice(-1500)}`,
+  };
+}
+
+// =========================================================
+// Step 6: Cross-server transfer staging1 -> live1
+// =========================================================
+async function runStep6(w: WizardRow): Promise<StepResult> {
+  const backupFile = `m7-wizard-${w.id}.zip`;
+  const tmpStaging = `/tmp/${backupFile}`;
+  const tmpLive = `/tmp/${backupFile}`;
+
+  // 6a. Backup the cloned WP on staging1
+  const clonedSrc = await lookupWpInstanceId(STAGING1, w.real_domain);
+  if (clonedSrc.id === null) return { status: 'failed', error: `Could not find cloned instance on staging1 for ${w.real_domain}: ${clonedSrc.error}` };
+  const r6a = await sshExec(STAGING1,
+    `plesk ext wp-toolkit --backup -instance-id ${clonedSrc.id} -operation backup -filename ${tmpStaging} -format raw 2>&1`, 600);
+  if (!r6a.ok) return { status: 'failed', error: `6a wp-toolkit backup failed:\n${r6a.stdout || r6a.stderr || r6a.error}` };
+
+  // 6b. Stream backup from staging1 to live1 via bastion
+  const r6b = await streamFile(STAGING1, tmpStaging, LIVE1, tmpLive);
+  if (!r6b.ok) return { status: 'failed', error: `6b file transfer failed:\n${r6b.error}` };
+
+  // 6c. Verify file on live1
+  const r6c = await sshExec(LIVE1, `ls -la ${tmpLive} 2>&1; stat -c '%s' ${tmpLive} 2>&1`, 30);
+  if (!r6c.ok) return { status: 'failed', error: `6c verify file on live1 failed:\n${r6c.stdout || r6c.stderr || r6c.error}` };
+
+  // 6d. Create empty subscription on live1 (similar pattern to Step 4)
+  const cnameExists = await sshExec(LIVE1, `plesk bin domain --info ${shellQ(w.real_domain)} 2>&1 || true`, 30);
+  if (cnameExists.ok && /^id:\s*\d+/m.test(cnameExists.stdout)) {
+    return { status: 'failed', error: `Subscription for ${w.real_domain} already exists on live1.\n${cnameExists.stdout.slice(0, 500)}\nDelete manually in Plesk first.` };
+  }
+  const clientLogin = genLogin(w.staging_slug, 'c');
+  const clientPw = genPassword(24);
+  const sysLogin = genLogin(w.staging_slug, 's');
+  const sysPw = genPassword(24);
+  const cleanName = w.customer_name.replace(/'/g, '').slice(0, 60);
+  const r6d1 = await sshExec(LIVE1,
+    `plesk bin customer --create ${shellQ(clientLogin)} -name ${shellQ(cleanName)} -email ${shellQ(w.customer_contact_email)} -passwd ${shellQ(clientPw)} -company ${shellQ(cleanName)} 2>&1`, 60);
+  if (!r6d1.ok) return { status: 'failed', error: `6d Plesk client create on live1 failed:\n${r6d1.stdout || r6d1.stderr || r6d1.error}` };
+  const r6d2 = await sshExec(LIVE1,
+    `plesk bin subscription --create ${shellQ(w.real_domain)} -owner ${shellQ(clientLogin)} -service-plan Unlimited -login ${shellQ(sysLogin)} -passwd ${shellQ(sysPw)} -ip 217.154.61.216 2>&1`, 90);
+  if (!r6d2.ok) return { status: 'failed', error: `6d Plesk subscription create on live1 failed:\n${r6d2.stdout || r6d2.stderr || r6d2.error}` };
+
+  // 6e. Look up the new domain ID on live1
+  const liveDomain = await lookupDomainId(LIVE1, w.real_domain);
+  if (liveDomain.id === null) return { status: 'failed', error: `6e Could not look up domain id on live1: ${liveDomain.error}` };
+
+  // 6f. Restore on live1
+  const r6f = await sshExec(LIVE1,
+    `plesk ext wp-toolkit --backup -main-domain-id ${liveDomain.id} -path / -operation restore -filename ${tmpLive} -format raw 2>&1`, 900);
+  if (!r6f.ok) return { status: 'failed', error: `6f wp-toolkit restore on live1 failed:\n${r6f.stdout || r6f.stderr || r6f.error}` };
+
+  // 6g. Verify restored WP exists
+  const verify = await lookupWpInstanceId(LIVE1, w.real_domain);
+  if (verify.id === null) return { status: 'failed', error: `6g Verify failed - no WP instance found on live1 for ${w.real_domain}: ${verify.error}` };
+
+  // 6h. Cleanup tmp files (best-effort)
+  await sshExec(STAGING1, `rm -f ${tmpStaging}`, 15).catch(() => {});
+  await sshExec(LIVE1, `rm -f ${tmpLive}`, 15).catch(() => {});
+
+  return {
+    status: 'success',
+    output: `Cross-server transfer complete.\n\n6a backup on staging1 (tail):\n${r6a.stdout.slice(-500)}\n\n6b file transfer: OK\n\n6c verify file size on live1:\n${r6c.stdout.slice(0, 300)}\n\n6d new subscription on live1:\n  client login:  ${clientLogin}\n  client pw:     ${clientPw}\n  sys user:      ${sysLogin}\n  sys pw:        ${sysPw}\n\n6f restore on live1 (tail):\n${r6f.stdout.slice(-500)}\n\n6g verify: WP instance ${verify.id} alive on live1\n\n6h: tmp files cleaned.\n\nWP is now live on live1 at the real domain (not yet reachable until Step 7 DNS).`,
+  };
+}
+
+// =========================================================
+// Step 7: Cloudflare DNS A record
+// =========================================================
+async function runStep7(w: WizardRow): Promise<StepResult> {
+  const token = await getCloudflareToken();
+  if (!token) {
+    return { status: 'failed', error: `No Cloudflare token configured. Paste yours at https://bastion.infra.aemsystems.co.uk/settings/integrations first.` };
+  }
+
+  const zone = await findZoneForDomain(w.real_domain, token);
+  if (!zone) {
+    return { status: 'failed', error: `Cloudflare zone for ${w.real_domain} not found in this account.\nEither add the zone at Cloudflare first, OR point the registrar's NS to our Cloudflare NS, then re-run.` };
+  }
+  if (zone.status !== 'active') {
+    return { status: 'failed', error: `Cloudflare zone '${zone.name}' exists but status='${zone.status}' (expected 'active'). DNS won't resolve until zone is active.` };
+  }
+
+  const liveIp = await resolveServerIp(LIVE1);
+
+  const r = await upsertARecord(zone.id, w.real_domain, liveIp, token, false);
+
+  return {
+    status: 'success',
+    output: `Cloudflare DNS:\n  Zone:       ${zone.name} (${zone.id})\n  Record:     ${w.real_domain} -> ${liveIp}\n  Action:     ${r.action}\n  Record ID:  ${r.record.id}\n  Proxied:    ${r.record.proxied}\n  TTL:        ${r.record.ttl}\n\nDNS propagation typically 1-5 minutes. Test:\n  curl -s 'https://dns.google/resolve?name=${w.real_domain}&type=A'`,
+  };
+}

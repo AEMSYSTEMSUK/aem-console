@@ -1,0 +1,64 @@
+import { cookies } from 'next/headers';
+import { redirect } from 'next/navigation';
+import { getSession } from '@/lib/sessions';
+import { getUserById } from '@/lib/users';
+import { recentAuditLog } from '@/lib/audit';
+import LogoutButton from './LogoutButton';
+
+export default async function DashboardPage() {
+  const cookieStore = await cookies();
+  const sessionId = cookieStore.get('aem_session')?.value;
+  if (!sessionId) redirect('/auth/login');
+  const sess = await getSession(sessionId);
+  if (!sess) redirect('/auth/login');
+  const user = await getUserById(sess.user_id);
+  if (!user) redirect('/auth/login');
+
+  const entries = await recentAuditLog(20);
+
+  return (
+    <main className="min-h-screen p-6 max-w-4xl mx-auto">
+      <header className="flex justify-between items-center mb-8 pb-4 border-b">
+        <div>
+          <h1 className="text-2xl font-medium">AEM Console</h1>
+          <p className="text-sm text-gray-500 mt-1">Signed in as {user.display_name ?? user.email}</p>
+        </div>
+        <div className="flex gap-4 items-center"><a href="/drift" className="text-sm text-blue-600">Drift</a><a href="/vulnerabilities" className="text-sm text-blue-600">CVEs</a><a href="/dmarc" className="text-sm text-blue-600">DMARC</a><a href="/guides" className="text-sm text-blue-600">Guides</a><a href="/alerts" className="text-sm text-blue-600">Alerts</a><a href="/backups" className="text-sm text-blue-600">Backups</a><a href="/inventory" className="text-sm text-blue-600">Inventory</a><a href="/admin/servers" className="text-sm text-blue-600">Servers</a><LogoutButton /></div>
+      </header>
+
+      <section>
+        <h2 className="text-lg font-medium mb-4">Recent audit log</h2>
+        {entries.length === 0 ? (
+          <p className="text-sm text-gray-500">No events yet.</p>
+        ) : (
+          <div className="border rounded">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-left">
+                <tr>
+                  <th className="px-3 py-2">When</th>
+                  <th className="px-3 py-2">Actor</th>
+                  <th className="px-3 py-2">Action</th>
+                  <th className="px-3 py-2">Target</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((e) => (
+                  <tr key={e.id} className="border-t">
+                    <td className="px-3 py-2 text-gray-500 font-mono text-xs">{e.created_at}</td>
+                    <td className="px-3 py-2">{e.actor_user_id ?? 'system'}</td>
+                    <td className="px-3 py-2 font-mono">{e.action}</td>
+                    <td className="px-3 py-2 text-gray-600">{e.target_type}{e.target_id ? `/${e.target_id.slice(0, 20)}...` : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <footer className="mt-8 pt-4 border-t text-xs text-gray-400">
+        <p>Phase 0 + F1 + F2 + M1 — 16 Jun 2026</p>
+      </footer>
+    </main>
+  );
+}

@@ -1,0 +1,283 @@
+import { db } from '@/lib/db';
+import { sshExec } from '@/lib/ssh';
+import { spawn } from 'child_process';
+
+export interface WizardInput {
+  customer_name: string;
+  customer_contact_email: string;
+  staging_slug: string;
+  real_domain: string;
+}
+
+export interface StepDef {
+  number: number;
+  name: string;
+  role_required: 'admin' | 'web';
+}
+
+export const STEPS: StepDef[] = [
+  { number: 1,  name: 'Validate inputs', role_required: 'web' },
+  { number: 2,  name: 'Create <slug>.aemstaging.co.uk + install WP', role_required: 'web' },
+  { number: 3,  name: 'Notify support@aemsystems.co.uk', role_required: 'web' },
+  { number: 4,  name: 'Admin: create customer subscription on staging1', role_required: 'admin' },
+  { number: 5,  name: 'WP Toolkit clone staging slug -> real domain (staging1)', role_required: 'admin' },
+  { number: 6,  name: 'Transfer staging1 -> live1 (backup/scp/restore)', role_required: 'admin' },
+  { number: 7,  name: 'Cloudflare DNS A record (real domain -> live1 IP)', role_required: 'admin' },
+  { number: 8,  name: 'Plesk DNS template sync (live1)', role_required: 'admin' },
+  { number: 9,  name: "Let's Encrypt SSL (live1)", role_required: 'admin' },
+  { number: 10, name: 'WP search-replace residual URLs', role_required: 'admin' },
+  { number: 11, name: 'Customer mailbox creation', role_required: 'admin' },
+  { number: 12, name: 'Verify + schedule 7-day staging drop', role_required: 'admin' },
+];
+
+export interface WizardRow {
+  id: number;
+  customer_name: string;
+  customer_contact_email: string;
+  staging_slug: string;
+  real_domain: string;
+  target_live_server: string;
+  current_step: number;
+  status: string;
+  created_by_user_id: number;
+  created_at: string;
+  completed_at: string | null;
+  staging_drop_at: string | null;
+  staging_dropped_at: string | null;
+  notes: string | null;
+}
+
+export interface StepRow {
+  id: number;
+  wizard_id: number;
+  step_number: number;
+  step_name: string;
+  role_required: string;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  output: string | null;
+  error: string | null;
+}
+
+function genPassword(len = 20): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let pw = '';
+  for (let i = 0; i < len; i++) pw += chars[Math.floor(Math.random() * chars.length)];
+  return pw;
+}
+
+function shellQ(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+async function sendMail(opts: { to: string; from: string; subject: string; body: string }): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('mail', ['-r', opts.from, '-s', opts.subject, opts.to]);
+    child.stdin.write(opts.body);
+    child.stdin.end();
+    let err = '';
+    child.stderr.on('data', d => err += d.toString());
+    child.on('exit', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`mail exit ${code}: ${err}`));
+    });
+    child.on('error', reject);
+  });
+}
+
+export async function createWizard(input: WizardInput, createdByUserId: number): Promise<number> {
+  if (!/^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/.test(input.staging_slug)) {
+    throw new Error('Invalid slug: lowercase letters/digits/hyphens, 3-64 chars, start/end alnum');
+  }
+  if (!/^[a-z0-9][a-z0-9.-]+\.[a-z]{2,}$/i.test(input.real_domain)) {
+    throw new Error('Invalid real domain');
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(input.customer_contact_email)) {
+    throw new Error('Invalid contact email');
+  }
+  if (!input.customer_name.trim()) {
+    throw new Error('Customer name required');
+  }
+
+  const r = await db.query<{ id: number }>(`
+    INSERT INTO onboarding_wizards
+      (customer_name, customer_contact_email, staging_slug, real_domain, target_live_server, current_step, status, created_by_user_id)
+    VALUES ($1, $2, $3, $4, 'live1', 1, 'in_progress', $5)
+    RETURNING id
+  `, [
+    input.customer_name.trim(),
+    input.customer_contact_email.toLowerCase(),
+    input.staging_slug.toLowerCase(),
+    input.real_domain.toLowerCase(),
+    createdByUserId,
+  ]);
+  const wizardId = r.rows[0].id;
+
+  for (const s of STEPS) {
+    await db.query(
+      `INSERT INTO onboarding_steps (wizard_id, step_number, step_name, role_required) VALUES ($1, $2, $3, $4)`,
+      [wizardId, s.number, s.name, s.role_required]
+    );
+  }
+  return wizardId;
+}
+
+export async function getWizard(id: number): Promise<{ wizard: WizardRow; steps: StepRow[] } | null> {
+  const w = await db.query<WizardRow>('SELECT * FROM onboarding_wizards WHERE id = $1', [id]);
+  if (w.rows.length === 0) return null;
+  const s = await db.query<StepRow>(
+    'SELECT * FROM onboarding_steps WHERE wizard_id = $1 ORDER BY step_number',
+    [id]
+  );
+  return { wizard: w.rows[0], steps: s.rows };
+}
+
+interface StepResult { status: 'success' | 'failed'; output?: string; error?: string; }
+
+export async function runStep(wizardId: number, stepNumber: number): Promise<StepResult> {
+  const data = await getWizard(wizardId);
+  if (!data) throw new Error('Wizard not found');
+  const { wizard } = data;
+
+  await db.query(
+    `UPDATE onboarding_steps SET status='running', started_at=now(), error=NULL, output=NULL WHERE wizard_id=$1 AND step_number=$2`,
+    [wizardId, stepNumber]
+  );
+
+  let result: StepResult;
+  try {
+    switch (stepNumber) {
+      case 1:
+        result = {
+          status: 'success',
+          output: `Inputs OK.\n  slug='${wizard.staging_slug}' -> https://${wizard.staging_slug}.aemstaging.co.uk\n  real domain='${wizard.real_domain}'\n  customer email='${wizard.customer_contact_email}'`,
+        };
+        break;
+      case 2:
+        result = await runStep2(wizard);
+        break;
+      case 3:
+        result = await runStep3(wizard);
+        break;
+      default:
+        result = { status: 'failed', error: 'Not implemented in Phase 1b. Phase 2 = Steps 4-7, Phase 3 = Steps 8-12.' };
+    }
+  } catch (e: unknown) {
+    result = { status: 'failed', error: (e as Error)?.message ?? String(e) };
+  }
+
+  await db.query(
+    `UPDATE onboarding_steps SET status=$1, output=$2, error=$3, completed_at=now() WHERE wizard_id=$4 AND step_number=$5`,
+    [result.status, result.output ?? null, result.error ?? null, wizardId, stepNumber]
+  );
+
+  if (result.status === 'success') {
+    await db.query(
+      `UPDATE onboarding_wizards SET current_step=$1 WHERE id=$2 AND current_step < $1`,
+      [stepNumber + 1, wizardId]
+    );
+    if (stepNumber === 12) {
+      await db.query(
+        `UPDATE onboarding_wizards SET status='completed', completed_at=now(), staging_drop_at=now()+interval '7 days' WHERE id=$1`,
+        [wizardId]
+      );
+    }
+  }
+  return result;
+}
+
+async function runStep2(w: WizardRow): Promise<StepResult> {
+  const slug = w.staging_slug;
+  const fqdn = `${slug}.aemstaging.co.uk`;
+  const password = genPassword(20);
+  const title = `${w.customer_name} (staging)`.replace(/[^\w\s\-()]/g, '').slice(0, 50);
+
+  // 2a. Create subdomain via Plesk CLI on staging1
+  const r1 = await sshExec(
+    'staging1.infra.aemsystems.co.uk',
+    `plesk bin subdomain --create ${shellQ(slug)} -domain aemstaging.co.uk -www-root ${shellQ(slug)} -php true 2>&1`,
+    60
+  );
+  if (!r1.ok) {
+    return {
+      status: 'failed',
+      error: `Subdomain create failed (exit not ok):\nstdout:\n${r1.stdout}\nstderr:\n${r1.stderr}\nerror: ${r1.error ?? ''}`,
+    };
+  }
+
+  // 2b. Brief settle
+  await new Promise(res => setTimeout(res, 2000));
+
+  // 2c. Install WP via wp-toolkit. Flag names confirmed via probe.
+  // No -admin-password flag exists; wp-toolkit auto-generates. We override in 2d.
+  const r2 = await sshExec(
+    'staging1.infra.aemsystems.co.uk',
+    `plesk ext wp-toolkit --install -domain-name ${shellQ(fqdn)} -path / -username admin -admin-email security@aemtech.co.uk -site-title ${shellQ(title)} -protocol https -language en_US 2>&1`,
+    180
+  );
+  if (!r2.ok) {
+    return {
+      status: 'failed',
+      error: `wp-toolkit --install failed:\nstdout:\n${r2.stdout}\nstderr:\n${r2.stderr}\nerror: ${r2.error ?? ''}`,
+    };
+  }
+
+  // 2d. Set known admin password via wp-cli (so we can hand creds to web team).
+  const r3 = await sshExec(
+    'staging1.infra.aemsystems.co.uk',
+    `plesk bin wp-cli --domain ${shellQ(fqdn)} -- user update admin --user_pass=${shellQ(password)} 2>&1`,
+    60
+  );
+  const pwNote = r3.ok
+    ? `Admin password set via wp-cli.`
+    : `WARNING: Could not set admin password via wp-cli (wp-toolkit auto-generated one). Set manually with:
+       plesk bin wp-cli --domain ${fqdn} -- user update admin --user_pass="..."
+       Error: ${r3.stderr || r3.error}`;
+
+  return {
+    status: 'success',
+    output: `Created ${fqdn} + installed WP.
+
+Subdomain creation output:
+${r1.stdout.slice(0, 800)}
+
+WP install output:
+${r2.stdout.slice(0, 1500)}
+
+${pwNote}
+
+Admin login:
+  URL:      https://${fqdn}/wp-admin
+  Username: admin
+  Password: ${password}`,
+  };
+}
+
+async function runStep3(w: WizardRow): Promise<StepResult> {
+  const subject = `[AEM Console] New customer onboarding: ${w.customer_name}`;
+  const body = `A new customer onboarding has been started by the web team.
+
+Customer:        ${w.customer_name}
+Contact email:   ${w.customer_contact_email}
+Staging URL:     https://${w.staging_slug}.aemstaging.co.uk
+Real domain:     ${w.real_domain}
+Target server:   ${w.target_live_server}
+Wizard ID:       ${w.id}
+
+Web team has completed Steps 1-3 (staging WP install is live).
+Next: Andy or Lewis to take over Steps 4-12 (admin handover).
+
+Console wizard:
+  https://bastion.infra.aemsystems.co.uk/onboarding/${w.id}
+
+-- AEM Console
+`;
+  await sendMail({
+    from: 'noreply@aemtech.co.uk',
+    to: 'support@aemsystems.co.uk',
+    subject,
+    body,
+  });
+  return { status: 'success', output: 'Notification mail sent to support@aemsystems.co.uk' };
+}

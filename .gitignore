@@ -1,0 +1,39 @@
+# AEM Console — repo tracks ONLY the Next.js app. /opt/aem-console on the bastion doubles as root's
+# working dir and is full of one-off ops scripts, caches and generated files; we deliberately leave all
+# of that untracked. Whitelist approach: ignore everything at the root, then re-include the app.
+
+# Ignore everything at the repo root by default…
+/*
+
+# …then track the app and its config/docs.
+!/.gitignore
+!/src/
+!/public/
+!/migrations/
+!/package.json
+!/package-lock.json
+!/next.config.ts
+!/next-env.d.ts
+!/tsconfig.json
+!/eslint.config.mjs
+!/postcss.config.mjs
+!/README.md
+!/AGENTS.md
+!/CLAUDE.md
+
+# guides/ is intentionally NOT tracked: the runbook markdown contains live secrets/creds. The app
+# serves it from disk (process.cwd()/guides or AEM_GUIDES_DIR), so it stays untracked on the bastion.
+
+# Belt-and-braces: never track deps, build output, env or secrets even inside tracked dirs.
+node_modules/
+.next/
+out/
+.env
+.env.*
+*.key
+*.pem
+*.log
+keys/
+
+# Editor/backup cruft
+*.bak*

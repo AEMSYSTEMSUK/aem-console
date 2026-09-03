@@ -1,0 +1,110 @@
+import { getWizard, STEPS } from '@/lib/onboarding';
+import { requireUser } from '@/lib/rbac';
+import { notFound } from 'next/navigation';
+import { RunStepButton } from './run-step-button';
+import { OverwriteToggle } from './overwrite-toggle';
+import { AutoRefresh } from './auto-refresh';
+import { SkipStepButton } from './skip-step-button';
+
+export const dynamic = 'force-dynamic';
+
+export default async function WizardPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const wizardId = parseInt(id, 10);
+  if (!Number.isFinite(wizardId)) notFound();
+  const me = await requireUser();
+  const data = await getWizard(wizardId);
+  if (!data) notFound();
+  const { wizard, steps } = data;
+
+  return (
+    <main style={{ maxWidth: 980, margin: '2rem auto', padding: '0 1rem', fontFamily: 'system-ui' }}>
+      <h1>Onboarding #{wizard.id}: {wizard.customer_name}</h1>
+      <p style={{ color: '#666' }}>
+        Staging: <a href={`https://${wizard.staging_slug}.aemstaging.co.uk`} target="_blank" rel="noreferrer">
+          {wizard.staging_slug}.aemstaging.co.uk
+        </a>
+        &nbsp;-&gt;&nbsp;Production: <strong>{wizard.real_domain}</strong> on <strong>{wizard.target_live_server}</strong>
+      </p>
+      <AutoRefresh enabled={steps.some(s => s.status === 'running')} />
+
+      <p>
+        Status: <strong>{wizard.status}</strong> &nbsp;|&nbsp;
+        Current step: <strong>{wizard.current_step}</strong> &nbsp;|&nbsp;
+        You: <strong>{me.role}</strong>
+      </p>
+
+      {me.role === 'admin' && <OverwriteToggle wizardId={wizard.id} initial={wizard.overwrite_existing} />}
+
+      <table style={{ width: '100%', borderCollapse: 'collapse', marginTop: '1.5rem', fontSize: '0.9rem' }}>
+        <thead>
+          <tr style={{ background: '#f0f0f0', textAlign: 'left' }}>
+            <th style={{ padding: '.5rem' }}>#</th>
+            <th style={{ padding: '.5rem' }}>Step</th>
+            <th style={{ padding: '.5rem' }}>Role</th>
+            <th style={{ padding: '.5rem' }}>Status</th>
+            <th style={{ padding: '.5rem' }}>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {steps.map(s => {
+            const def = STEPS.find(x => x.number === s.step_number);
+            const canRun = (def?.role_required === 'admin' ? me.role === 'admin' : true)
+              && (s.status === 'pending' || s.status === 'failed')
+              && s.step_number === wizard.current_step;
+            return (
+              <tr key={s.id} style={{ borderBottom: '1px solid #ddd', verticalAlign: 'top' }}>
+                <td style={{ padding: '.5rem' }}>{s.step_number}</td>
+                <td style={{ padding: '.5rem' }}>
+                  <div>{s.step_name}</div>
+                  {s.status === 'running' && s.progress_pct !== null && (
+                    <div style={{ marginTop: '.25rem' }}>
+                      <div style={{ background: '#e0e0e0', borderRadius: 4, overflow: 'hidden', height: 14 }}>
+                        <div style={{ background: '#1976d2', width: `${s.progress_pct}%`, height: '100%', transition: 'width .5s ease' }} />
+                      </div>
+                      <div style={{ fontSize: '0.75rem', color: '#666', marginTop: '.15rem' }}>{s.progress_pct}%</div>
+                    </div>
+                  )}
+                  {s.output && (
+                    <pre style={{ background: '#f8f8f8', padding: '.5rem', fontSize: '0.75rem',
+                                   marginTop: '.25rem', whiteSpace: 'pre-wrap', maxHeight: 220, overflow: 'auto' }}>
+                      {s.output}
+                    </pre>
+                  )}
+                  {s.error && (
+                    <pre style={{ background: '#fee', padding: '.5rem', fontSize: '0.75rem',
+                                   marginTop: '.25rem', whiteSpace: 'pre-wrap', color: '#a00', maxHeight: 220, overflow: 'auto' }}>
+                      {s.error}
+                    </pre>
+                  )}
+                </td>
+                <td style={{ padding: '.5rem' }}>{s.role_required}</td>
+                <td style={{ padding: '.5rem' }}><StepStatusBadge status={s.status} /></td>
+                <td style={{ padding: '.5rem' }}>
+                  {canRun && <RunStepButton wizardId={wizard.id} stepNumber={s.step_number} />}
+                  {me.role === 'admin' && (s.status === 'pending' || s.status === 'failed') && <SkipStepButton wizardId={wizard.id} stepNumber={s.step_number} />}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </main>
+  );
+}
+
+function StepStatusBadge({ status }: { status: string }) {
+  const colors: Record<string, string> = {
+    pending: '#888',
+    running: '#1976d2',
+    success: '#2e7d32',
+    failed: '#c62828',
+    skipped: '#888',
+  };
+  return (
+    <span style={{ background: colors[status] ?? '#888', color: 'white',
+                   padding: '.15rem .5rem', borderRadius: 3, fontSize: '0.85rem' }}>
+      {status}
+    </span>
+  );
+}
