@@ -32,8 +32,9 @@ export async function POST(req: NextRequest) {
   const server = r.rows[0];
   if (!server) return NextResponse.json({ ok: false, error: `no hosted site/server for ${domain}` }, { status: 404 });
 
-  // Read the cert the origin serves for this SNI, locally on the box (bypasses Cloudflare entirely).
-  const cmd = `echo | timeout 10 openssl s_client -servername ${sq(domain)} -connect 127.0.0.1:443 2>/dev/null | openssl x509 -noout -issuer -startdate -enddate 2>/dev/null`;
+  // Read the cert the origin serves for this SNI by connecting to the server's own fqdn on 443 (Plesk's
+  // nginx binds HTTPS to the real IP, not loopback) — bypasses Cloudflare entirely.
+  const cmd = `echo | timeout 10 openssl s_client -servername ${sq(domain)} -connect ${sq(server.fqdn)}:443 2>/dev/null | openssl x509 -noout -issuer -startdate -enddate 2>/dev/null`;
   const res = await sshExec(server.fqdn, cmd, 25);
   const out = res.stdout || '';
   const issuer = (out.match(/issuer=.*?(?:O\s*=\s*|CN\s*=\s*)([^,\n/]+)/i)?.[1] || out.match(/issuer=(.*)/)?.[1] || '').trim() || null;
