@@ -126,7 +126,7 @@ export default async function WizardPage({ params }: { params: Promise<{ id: str
       {me.role === 'admin' && wizard.current_step >= 6 && (
         <CheckLiveButton wizardId={wizard.id} realDomain={wizard.real_domain} targetServer={(wizard.target_live_server || 'live1') + '.infra.aemsystems.co.uk'} />
       )}
-      {me.role === 'admin' && wizard.current_step >= 5 && (
+      {me.role === 'admin' && wizard.current_step >= 2 && (
         <DropStagingButton wizardId={wizard.id} realDomain={wizard.real_domain} dropAt={wizard.staging_drop_at} droppedAt={wizard.staging_dropped_at} />
       )}
       <ExportButton wizardId={wizard.id} />
