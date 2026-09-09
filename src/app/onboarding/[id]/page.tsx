@@ -13,6 +13,7 @@ import { CheckLiveButton } from './check-live-button';
 import { SetDomainForm } from './set-domain-form';
 import { RewindButton } from './rewind-button';
 import { DropStagingButton } from './drop-staging-button';
+import { DeleteWizardButton } from './delete-wizard-button';
 
 export const dynamic = 'force-dynamic';
 
@@ -130,6 +131,9 @@ export default async function WizardPage({ params }: { params: Promise<{ id: str
         <DropStagingButton wizardId={wizard.id} realDomain={wizard.real_domain} dropAt={wizard.staging_drop_at} droppedAt={wizard.staging_dropped_at} />
       )}
       <ExportButton wizardId={wizard.id} />
+      {me.role === 'admin' && (
+        <DeleteWizardButton wizardId={wizard.id} customerName={wizard.customer_name} stagingDropped={!!wizard.staging_dropped_at} />
+      )}
     </main>
   );
 }
