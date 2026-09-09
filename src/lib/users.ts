@@ -4,6 +4,7 @@ export interface User {
   id: number;
   email: string;
   display_name: string | null;
+  enroll_allowed: boolean;
 }
 
 export interface WebAuthnCredentialRow {
@@ -18,7 +19,7 @@ export interface WebAuthnCredentialRow {
 
 export async function getUserByEmail(email: string): Promise<User | null> {
   const r = await db.query<User>(
-    'SELECT id, email, display_name FROM users WHERE email = $1',
+    'SELECT id, email, display_name, enroll_allowed FROM users WHERE email = $1',
     [email]
   );
   return r.rows[0] ?? null;
@@ -26,10 +27,22 @@ export async function getUserByEmail(email: string): Promise<User | null> {
 
 export async function getUserById(id: number): Promise<User | null> {
   const r = await db.query<User>(
-    'SELECT id, email, display_name FROM users WHERE id = $1',
+    'SELECT id, email, display_name, enroll_allowed FROM users WHERE id = $1',
     [id]
   );
   return r.rows[0] ?? null;
+}
+
+/**
+ * Open or close the one-time passkey-enrollment window for a user.
+ * Enrollment issues a session with no prior auth, so it must stay closed
+ * except during a deliberate invite window opened by an admin.
+ */
+export async function setEnrollAllowed(userId: number, allowed: boolean): Promise<void> {
+  await db.query('UPDATE users SET enroll_allowed = $1, updated_at = now() WHERE id = $2', [
+    allowed,
+    userId,
+  ]);
 }
 
 export async function getCredentialsForUser(userId: number): Promise<WebAuthnCredentialRow[]> {
@@ -64,7 +77,7 @@ export async function getOrCreateUser(
      ON CONFLICT (email) DO UPDATE
        SET display_name = COALESCE(EXCLUDED.display_name, users.display_name),
            updated_at = now()
-     RETURNING id, email, display_name`,
+     RETURNING id, email, display_name, enroll_allowed`,
     [email, displayName, role]
   );
   return r.rows[0];

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyRegistrationResponse } from '@simplewebauthn/server';
 import { rpID, origin } from '@/lib/webauthn';
-import { getUserByEmail } from '@/lib/users';
+import { getUserByEmail, setEnrollAllowed } from '@/lib/users';
 import { db } from '@/lib/db';
 import { createSession } from '@/lib/sessions';
 import { audit } from '@/lib/audit';
@@ -19,6 +19,12 @@ export async function POST(req: NextRequest) {
   const user = await getUserByEmail(email);
   if (!user) {
     return NextResponse.json({ error: 'user not found' }, { status: 404 });
+  }
+
+  // Re-check the invite window here too — the options gate could be bypassed by
+  // replaying a stale challenge, so verify must not trust that options ran.
+  if (!user.enroll_allowed) {
+    return NextResponse.json({ error: 'enrollment not permitted' }, { status: 403 });
   }
 
   const chRes = await db.query<{ challenge: string }>(
@@ -64,6 +70,10 @@ export async function POST(req: NextRequest) {
   );
 
   await db.query(`DELETE FROM webauthn_challenges WHERE user_id = $1 AND type = 'registration'`, [user.id]);
+
+  // Consume the one-time invite window: an admin must deliberately re-open it
+  // (POST /api/admin/users/:id/allow-enroll) before this user can enroll again.
+  await setEnrollAllowed(user.id, false);
 
   const session = await createSession(user.id);
 

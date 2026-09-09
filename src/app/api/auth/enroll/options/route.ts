@@ -17,6 +17,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'user not found' }, { status: 404 });
   }
 
+  // Enrollment issues a session with no prior authentication, so it is only
+  // permitted inside a one-time invite window an admin has opened for this user.
+  // Otherwise anyone could register a passkey against a known email and take over
+  // the account. A generic 403 avoids leaking whether the email exists.
+  if (!user.enroll_allowed) {
+    return NextResponse.json({ error: 'enrollment not permitted' }, { status: 403 });
+  }
+
   const existing = await getCredentialsForUser(user.id);
 
   const options = await generateRegistrationOptions({

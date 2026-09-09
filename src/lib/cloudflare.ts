@@ -29,6 +29,16 @@ async function cfRequest<T>(path: string, init: RequestInit = {}, token: string)
   });
   const data = await r.json() as CfResult<T>;
   if (!r.ok || !data.success) {
+    // A 403/authentication error on a write (e.g. purge_cache) almost always means the API token is
+    // missing the matching permission group rather than being wrong. Make that actionable.
+    const codes = Array.isArray(data.errors) ? data.errors.map((e: any) => e?.code).filter(Boolean) : [];
+    const authIssue = r.status === 403 || r.status === 401 || codes.includes(9109) || codes.includes(10000);
+    if (authIssue && path.includes('/purge_cache')) {
+      throw new Error(`Cloudflare 403 on cache purge — the API token is missing the "Cache Purge" permission for this zone. Rotate/edit the token to add Zone → Cache Purge (Purge), then retry. (${JSON.stringify(data.errors)})`);
+    }
+    if (authIssue) {
+      throw new Error(`Cloudflare ${r.status} — the API token lacks a required permission for ${path}. Check the token's zone/account permission groups. (${JSON.stringify(data.errors)})`);
+    }
     throw new Error(`Cloudflare API ${r.status}: ${JSON.stringify(data.errors)}`);
   }
   return data.result;

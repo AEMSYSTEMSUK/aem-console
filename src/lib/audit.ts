@@ -3,6 +3,8 @@ import { db } from '@/lib/db';
 export type AuditAction =
   | 'user.enroll.start'
   | 'user.enroll.complete'
+  | 'user.enroll.window_opened'
+  | 'user.enroll.window_closed'
   | 'user.login.start'
   | 'user.login.complete'
   | 'user.logout'
