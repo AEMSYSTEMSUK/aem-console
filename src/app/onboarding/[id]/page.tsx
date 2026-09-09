@@ -12,6 +12,7 @@ import { ProvisionMailboxButton } from './provision-mailbox-button';
 import { CheckLiveButton } from './check-live-button';
 import { SetDomainForm } from './set-domain-form';
 import { RewindButton } from './rewind-button';
+import { DropStagingButton } from './drop-staging-button';
 
 export const dynamic = 'force-dynamic';
 
@@ -124,6 +125,9 @@ export default async function WizardPage({ params }: { params: Promise<{ id: str
       )}
       {me.role === 'admin' && wizard.current_step >= 6 && (
         <CheckLiveButton wizardId={wizard.id} realDomain={wizard.real_domain} targetServer={(wizard.target_live_server || 'live1') + '.infra.aemsystems.co.uk'} />
+      )}
+      {me.role === 'admin' && wizard.current_step >= 5 && (
+        <DropStagingButton wizardId={wizard.id} realDomain={wizard.real_domain} dropAt={wizard.staging_drop_at} droppedAt={wizard.staging_dropped_at} />
       )}
       <ExportButton wizardId={wizard.id} />
     </main>

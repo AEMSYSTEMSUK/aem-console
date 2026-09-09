@@ -1612,6 +1612,81 @@ Customer can now use https://${w.real_domain}`,
 }
 
 // =========================================================
+// Staging teardown (#93). Step 12 schedules staging_drop_at = now()+7d but
+// nothing consumed it — staging copies lived on forever. dropStaging performs
+// the actual removal (idempotent): the <slug> staging subdomain, plus the
+// real_domain subscription that Step 5's WP-Toolkit clone created on staging1.
+// Called by the admin "Drop staging now" button and by the daily cron sweep.
+// =========================================================
+export interface DropStagingResult {
+  ok: boolean;
+  output?: string;
+  error?: string;
+  alreadyDropped?: boolean;
+}
+
+export async function dropStaging(wizardId: number): Promise<DropStagingResult> {
+  const data = await getWizard(wizardId);
+  if (!data) return { ok: false, error: 'Wizard not found' };
+  const { wizard: w } = data;
+
+  if (w.staging_dropped_at) {
+    return { ok: true, alreadyDropped: true, output: `Staging for wizard ${wizardId} (${w.real_domain}) already dropped at ${w.staging_dropped_at}.` };
+  }
+
+  const host = stagingHost(w);
+  const sub = stagingSubdomain(w);
+  const lines: string[] = [];
+  let hadError = false;
+
+  // 1. Remove the staging subdomain (the WP install created in Step 2).
+  //    `|| true` + "does not exist" both treated as success so the sweep is idempotent.
+  const rmSub = await sshExec(host, `plesk bin subdomain --remove ${shellQ(sub.name)} -domain ${shellQ(sub.parent)} 2>&1 || true`, 60);
+  const subOut = (rmSub.stdout || rmSub.stderr || rmSub.error || '').trim();
+  const subOk = rmSub.ok && !/error|does not know|unable/i.test(subOut) || /does not exist|not found|no such/i.test(subOut);
+  if (!subOk) hadError = true;
+  lines.push(`subdomain ${sub.name}.${sub.parent} on ${host}: ${subOk ? 'removed/absent ✓' : 'ERROR ✗'}\n  ${subOut.slice(0, 300) || '(no output)'}`);
+
+  // 2. Remove the real_domain subscription that Step 5's clone created on staging1
+  //    (only staging1 receives that clone).
+  if ((w.staging_server || 'staging1') === 'staging1' && w.real_domain) {
+    const rmSubn = await sshExec(STAGING1, `plesk bin subscription --remove ${shellQ(w.real_domain)} 2>&1 || true`, 120);
+    const snOut = (rmSubn.stdout || rmSubn.stderr || rmSubn.error || '').trim();
+    const snOk = rmSubn.ok && !/error|unable/i.test(snOut) || /does not exist|not found|no such/i.test(snOut);
+    if (!snOk) hadError = true;
+    lines.push(`subscription ${w.real_domain} on staging1: ${snOk ? 'removed/absent ✓' : 'ERROR ✗'}\n  ${snOut.slice(0, 300) || '(no output)'}`);
+  }
+
+  // Only mark dropped when both removals came back clean; a partial failure leaves
+  // staging_drop_at set so the next sweep (or a manual retry) picks it up again.
+  if (!hadError) {
+    await db.query(`UPDATE onboarding_wizards SET staging_dropped_at=now(), staging_drop_at=NULL WHERE id=$1`, [wizardId]);
+  }
+
+  return {
+    ok: !hadError,
+    output: `Staging teardown for wizard ${wizardId} (${w.customer_name} — ${w.real_domain}):\n\n${lines.join('\n\n')}\n\n${hadError ? '⚠ One or more removals errored — staging_drop_at left set for retry.' : '✓ Marked staging_dropped_at; wizard staging is gone.'}`,
+    error: hadError ? 'One or more staging removals failed — see output.' : undefined,
+  };
+}
+
+// Daily sweep: drop any wizard whose scheduled staging_drop_at has passed and
+// which hasn't already been dropped. Wired to POST /api/cron/drop-staging-system.
+export async function dropDueStaging(): Promise<{ processed: number; results: Array<{ wizardId: number; realDomain: string; ok: boolean; alreadyDropped?: boolean; error?: string }> }> {
+  const due = await db.query<{ id: number; real_domain: string }>(
+    `SELECT id, real_domain FROM onboarding_wizards
+     WHERE staging_drop_at IS NOT NULL AND staging_drop_at <= now() AND staging_dropped_at IS NULL
+     ORDER BY staging_drop_at ASC`
+  );
+  const results: Array<{ wizardId: number; realDomain: string; ok: boolean; alreadyDropped?: boolean; error?: string }> = [];
+  for (const row of due.rows) {
+    const r = await dropStaging(row.id);
+    results.push({ wizardId: row.id, realDomain: row.real_domain, ok: r.ok, alreadyDropped: r.alreadyDropped, error: r.error });
+  }
+  return { processed: due.rows.length, results };
+}
+
+// =========================================================
 // setupRelay (called from /api/onboarding/[id]/setup-relay)
 // Creates a noreply@<real_domain> mailbox on mail.infra (for SMTP-submit
 // auth only — customer's MX stays elsewhere) and merges the relay IP into
