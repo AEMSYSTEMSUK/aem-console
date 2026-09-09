@@ -1625,6 +1625,20 @@ export interface DropStagingResult {
   alreadyDropped?: boolean;
 }
 
+// Did a Plesk `--remove` succeed? Treat as success when the target is already
+// absent (any of Plesk's phrasings), OR when Plesk printed its own success line —
+// even if surrounded by unrelated `ERR [util_exec] … proc_close()` internal noise,
+// which Plesk emits on the vhostmng step but which does not mean the removal failed.
+function stagingRemovalOk(r: { ok: boolean; stdout: string; stderr: string; error?: string }): boolean {
+  const out = (r.stdout || '') + '\n' + (r.stderr || '') + '\n' + (r.error || '');
+  // Already gone — idempotent success.
+  if (/does not exist|not found|no such|unable to find|was not found|is not found/i.test(out)) return true;
+  // Explicit Plesk success, regardless of surrounding ERR noise.
+  if (/SUCCESS:|completed|was removed|successfully removed|removal of .* completed/i.test(out)) return true;
+  // Otherwise only trust a clean exit with no genuine failure wording.
+  return r.ok && !/\bfailed to\b|\bcannot\b|permission denied|error:/i.test(out);
+}
+
 export async function dropStaging(wizardId: number): Promise<DropStagingResult> {
   const data = await getWizard(wizardId);
   if (!data) return { ok: false, error: 'Wizard not found' };
@@ -1643,7 +1657,7 @@ export async function dropStaging(wizardId: number): Promise<DropStagingResult> 
   //    `|| true` + "does not exist" both treated as success so the sweep is idempotent.
   const rmSub = await sshExec(host, `plesk bin subdomain --remove ${shellQ(sub.name)} -domain ${shellQ(sub.parent)} 2>&1 || true`, 60);
   const subOut = (rmSub.stdout || rmSub.stderr || rmSub.error || '').trim();
-  const subOk = rmSub.ok && !/error|does not know|unable/i.test(subOut) || /does not exist|not found|no such/i.test(subOut);
+  const subOk = stagingRemovalOk(rmSub);
   if (!subOk) hadError = true;
   lines.push(`subdomain ${sub.name}.${sub.parent} on ${host}: ${subOk ? 'removed/absent ✓' : 'ERROR ✗'}\n  ${subOut.slice(0, 300) || '(no output)'}`);
 
@@ -1652,7 +1666,7 @@ export async function dropStaging(wizardId: number): Promise<DropStagingResult> 
   if ((w.staging_server || 'staging1') === 'staging1' && w.real_domain) {
     const rmSubn = await sshExec(STAGING1, `plesk bin subscription --remove ${shellQ(w.real_domain)} 2>&1 || true`, 120);
     const snOut = (rmSubn.stdout || rmSubn.stderr || rmSubn.error || '').trim();
-    const snOk = rmSubn.ok && !/error|unable/i.test(snOut) || /does not exist|not found|no such/i.test(snOut);
+    const snOk = stagingRemovalOk(rmSubn);
     if (!snOk) hadError = true;
     lines.push(`subscription ${w.real_domain} on staging1: ${snOk ? 'removed/absent ✓' : 'ERROR ✗'}\n  ${snOut.slice(0, 300) || '(no output)'}`);
   }
