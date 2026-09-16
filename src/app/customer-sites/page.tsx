@@ -1,5 +1,6 @@
 import { db } from '@/lib/db';
 import { CustomerSitesGrid } from './grid';
+import { DiscoverSitesButton } from './discover-button';
 
 export const dynamic = 'force-dynamic';
 
@@ -86,7 +87,10 @@ export default async function CustomerSitesPage() {
 
   return (
     <main style={{ padding: '2rem', maxWidth: 1800, margin: '0 auto' }}>
-      <h1>Customer Sites</h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap' }}>
+        <h1 style={{ margin: 0 }}>Customer Sites</h1>
+        <DiscoverSitesButton />
+      </div>
       <p style={{ color: '#666' }}>
         {rows.length} sites · {groupedParents.length} grouped customers · {stagingCount} in staging/sandbox.
         Coloured borders mark sites in the same customer group. Yellow STAGING badge = onboarding/test site.
