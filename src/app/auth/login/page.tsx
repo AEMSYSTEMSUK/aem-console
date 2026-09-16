@@ -5,9 +5,14 @@ export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [status, setStatus] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  const [next, setNext] = useState('/dashboard');
   useEffect(() => {
-    const e = new URLSearchParams(window.location.search).get('error');
+    const p = new URLSearchParams(window.location.search);
+    const e = p.get('error');
     if (e) setStatus(`Sign-in failed: ${e}`);
+    // Honour the return path the middleware stashed (?next=/servers/5). Local paths only (no open redirect).
+    const n = p.get('next');
+    if (n && n.startsWith('/') && !n.startsWith('//')) setNext(n);
   }, []);
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
@@ -38,7 +43,7 @@ export default function LoginPage() {
       }
       const result = await verifyRes.json();
       setStatus('Signed in. Redirecting...');
-      window.location.href = result.redirect || '/dashboard';
+      window.location.href = next || result.redirect || '/dashboard';
     } catch (err) {
       setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
       setBusy(false);
@@ -52,7 +57,7 @@ export default function LoginPage() {
           <p className="text-sm text-gray-500 mt-1">AEM Console</p>
         </div>
         <a
-          href="/api/auth/microsoft/start"
+          href={`/api/auth/microsoft/start${next && next !== '/dashboard' ? `?next=${encodeURIComponent(next)}` : ''}`}
           className="w-full flex items-center justify-center gap-2 rounded border border-gray-300 px-4 py-2 font-medium text-gray-800 hover:bg-gray-50"
         >
           <span aria-hidden className="inline-grid grid-cols-2 gap-px w-4 h-4">

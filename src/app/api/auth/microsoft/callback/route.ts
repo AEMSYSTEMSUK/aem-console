@@ -14,7 +14,7 @@ export async function GET(req: NextRequest) {
   const oauthErr = url.searchParams.get('error');
   const c = parse(req.headers.get('cookie') || '');
   const clear = (n: string) => serialize(n, '', { path: '/', maxAge: 0 });
-  const clearTmp = ['aem_oidc_state', 'aem_oidc_nonce', 'aem_oidc_verifier'].map(clear);
+  const clearTmp = ['aem_oidc_state', 'aem_oidc_nonce', 'aem_oidc_verifier', 'aem_oidc_next'].map(clear);
 
   const fail = (msg: string) => {
     const res = NextResponse.redirect(new URL('/auth/login?error=' + encodeURIComponent(msg), base));
@@ -49,7 +49,9 @@ export async function GET(req: NextRequest) {
     user_agent: req.headers.get('user-agent') ?? null,
   });
 
-  const res = NextResponse.redirect(new URL('/dashboard', base));
+  // Return the user to the page they originally clicked (stashed in aem_oidc_next), else the dashboard.
+  const dest = c.aem_oidc_next && c.aem_oidc_next.startsWith('/') && !c.aem_oidc_next.startsWith('//') ? c.aem_oidc_next : '/dashboard';
+  const res = NextResponse.redirect(new URL(dest, base));
   res.headers.append('Set-Cookie', serialize('aem_session', session.id, {
     httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: Math.floor(SESSION_TTL_MS / 1000),
   }));
