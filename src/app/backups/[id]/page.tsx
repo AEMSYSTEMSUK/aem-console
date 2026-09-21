@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 
-type Backup = { at: string | null; status: string; sizeMb: number | null };
+type Backup = { at: string | null; status: string; sizeMb: number | null; ref: string | null };
 type Job = {
   id: number; status: string; kind: string; triggered_by: string | null;
   started_at: string; finished_at: string | null; output: string | null;
@@ -66,6 +66,28 @@ export default function BackupServerDetail() {
       if (!r.ok) throw new Error(j.error || 'Failed to start backup');
       await load();
     } catch (e) { setErr((e as Error).message); } finally { setRunning(false); }
+  };
+
+  // ---- Phase 2: restore a subscription from a chosen dump ----
+  const [restoreDump, setRestoreDump] = useState<Backup | null>(null);
+  const [restoreDomain, setRestoreDomain] = useState('');
+  const [restoreConfirm, setRestoreConfirm] = useState('');
+  const [restoring, setRestoring] = useState(false);
+  const openRestore = (b: Backup) => { setRestoreDump(b); setRestoreDomain(''); setRestoreConfirm(''); setErr(null); };
+  const doRestore = async () => {
+    if (!restoreDump?.ref) return;
+    setRestoring(true);
+    setErr(null);
+    try {
+      const r = await fetch(`/api/backups/servers/${id}/restore`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: restoreDomain.trim(), ref: restoreDump.ref, confirm: restoreConfirm.trim() }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Restore failed to start');
+      setRestoreDump(null);
+      await load();
+    } catch (e) { setErr((e as Error).message); } finally { setRestoring(false); }
   };
 
   const s = d?.server;
@@ -142,7 +164,7 @@ export default function BackupServerDetail() {
               <div className="border rounded overflow-hidden">
                 <table className="w-full text-sm">
                   <thead className="bg-gray-50 text-left border-b"><tr>
-                    <th className="px-3 py-2">Taken</th><th className="px-3 py-2 w-32">Status</th><th className="px-3 py-2 w-28">Size</th>
+                    <th className="px-3 py-2">Taken</th><th className="px-3 py-2 w-32">Status</th><th className="px-3 py-2 w-28">Size</th><th className="px-3 py-2 w-28" />
                   </tr></thead>
                   <tbody>
                     {d.backups.map((b, i) => (
@@ -150,6 +172,7 @@ export default function BackupServerDetail() {
                         <td className="px-3 py-2">{fmt(b.at)}</td>
                         <td className="px-3 py-2"><span className={`inline-block px-2 py-0.5 rounded text-xs ${badge(b.status)}`}>{b.status}</span></td>
                         <td className="px-3 py-2">{fmtSize(b.sizeMb)}</td>
+                        <td className="px-3 py-2">{b.ref && <button onClick={() => openRestore(b)} disabled={jobRunning} className="text-rose-600 hover:underline disabled:text-gray-300">Restore…</button>}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -172,6 +195,34 @@ export default function BackupServerDetail() {
             <div className="flex justify-end gap-2">
               <button onClick={() => setConfirmOpen(false)} className="px-3 py-2 rounded border text-sm">Cancel</button>
               <button onClick={runBackup} className="px-4 py-2 rounded bg-gray-900 text-white text-sm">Run backup</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Restore dialog — destructive, typed-domain confirm */}
+      {restoreDump && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50" onClick={() => !restoring && setRestoreDump(null)}>
+          <div className="bg-white rounded-lg max-w-lg w-full p-5" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-medium mb-1 text-rose-700">Restore a subscription</h3>
+            <p className="text-sm text-gray-600 mb-3">
+              Restore a single subscription <strong>in place</strong> from the <span className="font-mono">{fmt(restoreDump.at)}</span> backup on <span className="font-mono">{s?.fqdn}</span>.
+              This <strong>overwrites the live site</strong> (files, databases, mail). A fresh safety backup of that subscription is taken first and the restore aborts if it fails.
+            </p>
+            <label className="block text-xs text-gray-500 mb-1">Domain to restore</label>
+            <input value={restoreDomain} onChange={(e) => setRestoreDomain(e.target.value)} placeholder="example.co.uk"
+              className="w-full border rounded px-3 py-2 text-sm mb-3 font-mono" />
+            <label className="block text-xs text-gray-500 mb-1">Type the domain again to confirm</label>
+            <input value={restoreConfirm} onChange={(e) => setRestoreConfirm(e.target.value)} placeholder="example.co.uk"
+              className="w-full border rounded px-3 py-2 text-sm mb-4 font-mono" />
+            {err && <div className="mb-3 text-sm text-red-700">{err}</div>}
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setRestoreDump(null)} disabled={restoring} className="px-3 py-2 rounded border text-sm">Cancel</button>
+              <button onClick={doRestore}
+                disabled={restoring || !restoreDomain.trim() || restoreDomain.trim().toLowerCase() !== restoreConfirm.trim().toLowerCase()}
+                className="px-4 py-2 rounded bg-rose-600 text-white text-sm disabled:opacity-40">
+                {restoring ? 'Starting…' : 'Restore (overwrites live)'}
+              </button>
             </div>
           </div>
         </div>
