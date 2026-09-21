@@ -57,7 +57,7 @@ export default async function BackupsPage() {
             {rows.map((r) => { const c = cls(r); const age = ageH(r.last_backup_at); return (
               <tr key={r.server_id} className="border-t align-top">
                 <td className="px-3 py-2"><span className={`inline-block w-2.5 h-2.5 rounded-full ${dot(c)}`}></span></td>
-                <td className="px-3 py-2"><div className="font-medium">{r.server_name}</div><div className="text-xs text-gray-500 font-mono">{r.fqdn}</div></td>
+                <td className="px-3 py-2"><Link href={`/backups/${r.server_id}`} className="font-medium text-blue-700 hover:underline">{r.server_name}</Link><div className="text-xs text-gray-500 font-mono">{r.fqdn}</div></td>
                 <td className="px-3 py-2 text-xs text-gray-600 font-mono">{r.role}</td>
                 <td className="px-3 py-2 text-xs"><span className={c === 'red' ? 'text-red-700' : c === 'amber' ? 'text-amber-700' : 'text-gray-700'}>{fmtAge(age)}{age !== null ? ' ago' : ''}</span></td>
                 <td className="px-3 py-2 text-xs">{r.last_backup_status ?? '—'}</td>
@@ -70,7 +70,7 @@ export default async function BackupsPage() {
           </tbody>
         </table>
       </section>
-      <p className="text-xs text-gray-400 mt-4">Phase 1 — health view. Restore actions (browse / restore offsite backups) coming in Phase 2.</p>
+      <p className="text-xs text-gray-400 mt-4">Click a server for its full backup history + on-demand &ldquo;Run backup now&rdquo; (Phase 1). Restore actions coming in Phase 2.</p>
     </main>
   );
 }
