@@ -94,8 +94,34 @@ export const STAGING1 = 'staging1.infra.aemsystems.co.uk';
 // Resolve the SSH host for this wizard's staging server.
 
 // Step progress: write phase status to /tmp for run-step button polling.
-import { writeFileSync as __writeStepStatus_w, unlinkSync as __writeStepStatus_u } from 'fs';
+import { writeFileSync as __writeStepStatus_w, unlinkSync as __writeStepStatus_u, readdirSync as __tmp_readdir, statSync as __tmp_stat } from 'fs';
+
+// Sweep orphaned progress files. Each step's status JSON is meant to be unlinked in a finally, but a
+// step that throws (or a process restart mid-run) leaves the file behind, so /tmp slowly fills with
+// aem-step-status-*.json / aem-export-status-*.json. Delete any older than the max age. Throttled to
+// run at most once per SWEEP_INTERVAL so the per-progress-tick writeStepStatus stays cheap.
+const STATUS_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6h — far longer than any real onboarding step
+const SWEEP_INTERVAL_MS = 10 * 60 * 1000;     // sweep at most every 10 min
+let __lastStatusSweep = 0;
+export function sweepStaleTmpStatus(force = false): number {
+  const now = Date.now();
+  if (!force && now - __lastStatusSweep < SWEEP_INTERVAL_MS) return 0;
+  __lastStatusSweep = now;
+  let removed = 0;
+  try {
+    for (const f of __tmp_readdir('/tmp')) {
+      if (!/^aem-(step|export)-status-.*\.json$/.test(f)) continue;
+      const p = '/tmp/' + f;
+      try {
+        if (now - __tmp_stat(p).mtimeMs > STATUS_MAX_AGE_MS) { __writeStepStatus_u(p); removed += 1; }
+      } catch { /* ignore individual file */ }
+    }
+  } catch { /* /tmp unreadable — ignore */ }
+  return removed;
+}
+
 function writeStepStatus(wid: number, step: number, phase: string, pct: number, message: string) {
+  sweepStaleTmpStatus();
   try { __writeStepStatus_w('/tmp/aem-step-status-' + wid + '-' + step + '.json', JSON.stringify({ phase, pct, message, ts: Date.now() })); } catch { /* ignore */ }
 }
 function clearStepStatus(wid: number, step: number) {

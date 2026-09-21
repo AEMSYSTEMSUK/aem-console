@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireUser, HttpError } from '@/lib/rbac';
 import { readFileSync, existsSync } from 'fs';
+import { sweepStaleTmpStatus } from '@/lib/onboarding';
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   try {
     await requireUser();
+    sweepStaleTmpStatus(); // opportunistic cleanup of orphaned /tmp status files (throttled)
     const { id } = await ctx.params;
     const wid = parseInt(id, 10);
     if (!Number.isFinite(wid)) throw new HttpError(400, 'Invalid wizard ID');

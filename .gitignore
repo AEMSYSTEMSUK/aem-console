@@ -38,3 +38,11 @@ keys/
 
 # Editor/backup cruft
 *.bak*
+*.pre-*
+*.pre_*
+*.orig
+*.rej
+*.old
+*.save
+*.swp
+*~
