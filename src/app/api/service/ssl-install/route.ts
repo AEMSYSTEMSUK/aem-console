@@ -54,17 +54,26 @@ export async function POST(req: NextRequest) {
 
   const certB64 = Buffer.from(certPem, 'utf8').toString('base64');
   const keyB64 = Buffer.from(keyPem, 'utf8').toString('base64');
-  const certName = `AEM-ONE ${domain}`;
+  // UNIQUE cert name per install. Previously the name was a constant `AEM-ONE <domain>`, so re-running
+  // create+assign with the SAME name left Plesk bound to the ORIGINAL (often apex-only) cert object —
+  // it never actually switched to the freshly-issued www-inclusive cert, and duplicates piled up. A
+  // fresh name forces `site --update` to do a real rebind onto the new cert. We then prune the old ones.
+  const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14);
+  const certName = `AEM-ONE ${domain} ${stamp}`;
+  const legacyName = `AEM-ONE ${domain}`; // pre-unique-name duplicates to clean up (best-effort)
 
-  // Install via Plesk CLI over the fleet SSH key: drop the PEMs in a temp dir, (re)create the cert in the
-  // domain's repository, then assign it and enable SSL. Idempotent — removes any prior AEM-ONE cert first.
+  // Install via Plesk CLI over the fleet SSH key: drop the PEMs in a temp dir, create a uniquely-named
+  // cert in the domain's repository, assign it (real rebind), then prune the old generic-named certs so
+  // the repo doesn't accumulate. www is an alias of the site, so assigning here secures www too.
   const script = [
     `TMP=$(mktemp -d)`,
     `printf %s ${sq(certB64)} | base64 -d > "$TMP/cert.pem"`,
     `printf %s ${sq(keyB64)} | base64 -d > "$TMP/key.pem"`,
-    `plesk bin certificate --remove ${sq(certName)} -domain ${sq(domain)} >/dev/null 2>&1 || true`,
     `CREATE=$(plesk bin certificate --create ${sq(certName)} -domain ${sq(domain)} -cert-file "$TMP/cert.pem" -key-file "$TMP/key.pem" 2>&1); CRC=$?`,
     `ASSIGN=$(plesk bin site --update ${sq(domain)} -ssl true -certificate-name ${sq(certName)} 2>&1); ARC=$?`,
+    // Now that the site is bound to the NEW cert, remove the old generic-named duplicate(s). Best-effort:
+    // the newly-assigned unique cert is untouched, and Plesk won't remove a cert that's still in use.
+    `plesk bin certificate --remove ${sq(legacyName)} -domain ${sq(domain)} >/dev/null 2>&1 || true`,
     `rm -rf "$TMP"`,
     `echo "--CREATE(rc=$CRC): $CREATE"`,
     `echo "--ASSIGN(rc=$ARC): $ASSIGN"`,
