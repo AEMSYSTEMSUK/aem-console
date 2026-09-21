@@ -36,8 +36,21 @@ export async function POST(req: NextRequest) {
         AND sv.fqdn IS NOT NULL AND COALESCE(sv.enabled, true)
       ORDER BY (s.host_server_id IS NOT NULL) DESC
       LIMIT 1`, [domain]);
-  const server = r.rows[0];
-  if (!server) return NextResponse.json({ ok: false, error: `No hosted site found for ${domain} (or it has no host server in Console)` }, { status: 404 });
+  let server: { fqdn: string; name: string } | undefined = r.rows[0];
+  let probedServerId: number | null = null;
+  if (!server) {
+    // Fallback: the domain isn't in Console's `sites` (site discovery never captured it — the cause of the
+    // whole "install failed" backlog). Ask each Plesk box directly which one hosts it, so a monitored-but-
+    // undiscovered site still gets its cert installed instead of 404-ing. Self-heals the `sites` row on a
+    // successful install so the fast DB lookup hits next time.
+    const cand = await db.query<{ id: number; fqdn: string; name: string }>(
+      `SELECT id, fqdn, name FROM servers WHERE role LIKE 'plesk-%' AND COALESCE(enabled, true) = true AND fqdn IS NOT NULL ORDER BY id`);
+    for (const c of cand.rows) {
+      const probe = await sshExec(c.fqdn, `plesk bin domain --info ${sq(domain)} >/dev/null 2>&1 && echo AEM_HOST_YES || echo AEM_HOST_NO`, 30);
+      if (probe.ok && probe.stdout.includes('AEM_HOST_YES')) { server = { fqdn: c.fqdn, name: c.name }; probedServerId = c.id; break; }
+    }
+    if (!server) return NextResponse.json({ ok: false, error: `No hosted site found for ${domain} (not in Console sites, and no Plesk server reports hosting it)` }, { status: 404 });
+  }
 
   const certB64 = Buffer.from(certPem, 'utf8').toString('base64');
   const keyB64 = Buffer.from(keyPem, 'utf8').toString('base64');
@@ -62,5 +75,14 @@ export async function POST(req: NextRequest) {
   const out = `${res.stdout}\n${res.stderr}`.trim();
   const ok = res.ok && res.stdout.includes('AEM_SSL_INSTALL_OK');
   if (!ok) return NextResponse.json({ ok: false, error: out.slice(-800) || res.error || 'install failed', installedOn: server.fqdn }, { status: 200 });
+  // If we resolved the host by probing (domain wasn't in `sites`), cache it so future lookups hit the DB
+  // fast-path. Best-effort — a schema/NOT NULL mismatch must never fail an otherwise-successful install.
+  if (probedServerId != null) {
+    await db.query(
+      `INSERT INTO sites (domain, host_server_id) VALUES ($1, $2)
+       ON CONFLICT (domain) DO UPDATE SET host_server_id = EXCLUDED.host_server_id`,
+      [domain, probedServerId],
+    ).catch(() => { /* caching is a bonus; the cert is already installed */ });
+  }
   return NextResponse.json({ ok: true, installedOn: server.fqdn, server: server.name, output: out.slice(-400) });
 }
