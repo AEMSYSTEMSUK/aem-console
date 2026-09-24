@@ -843,6 +843,13 @@ async function runStep3(w: WizardRow): Promise<StepResult> {
 // Step 4: Create customer Plesk subscription on staging1
 // =========================================================
 async function runStep4(w: WizardRow): Promise<StepResult> {
+  // Guard: don't create a Plesk subscription until the real domain is set (placeholder 'TBD'/blank
+  // would make a bogus subscription named "TBD"). Set it via "Set domain" on the onboarding page.
+  const rd4 = String(w.real_domain || '').trim();
+  if (!rd4 || /^tbd$/i.test(rd4) || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(rd4)) {
+    return { status: 'failed', error: `Set the customer's real domain first — it's currently "${w.real_domain || '(blank)'}". Use the "Set domain" control on the onboarding page, then re-run this step.` };
+  }
+
   const clientLogin = genLogin(w.staging_slug, 'c');
   const clientPw = genPassword(24);
   const sysLogin = genLogin(w.staging_slug, 's');
@@ -1752,6 +1759,14 @@ export async function setupRelay(wizardId: number, localPart: string = 'noreply'
   const data = await getWizard(wizardId);
   if (!data) return { ok: false, error: 'Wizard not found' };
   const { wizard: w } = data;
+
+  // Guard: the real domain must be set first. While it's still the placeholder 'TBD' (or blank/not a
+  // valid domain) any Plesk create runs against a bogus name (`subscription --create TBD …` → syntax
+  // error). Set the domain via the "Set domain" control on the onboarding page, then re-run.
+  const rd = String(w.real_domain || '').trim();
+  if (!rd || /^tbd$/i.test(rd) || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(rd)) {
+    return { ok: false, error: `Set the customer's real domain first — it's currently "${w.real_domain || '(blank)'}". Use the "Set domain" control on the onboarding page, then re-run this step.` };
+  }
 
   // Sanitize local-part — alnum + dot/underscore/hyphen, max 30 chars
   const lp = String(localPart || 'noreply').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 30);

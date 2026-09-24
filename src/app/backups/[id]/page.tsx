@@ -155,6 +155,42 @@ export default function BackupServerDetail() {
             )}
           </section>
 
+          {/* Phase 3: backup policy & offsite health (computed from the live dump list + health snapshot) */}
+          {(() => {
+            const dumps = d.backups.filter((b) => b.at);
+            const retained = dumps.length;
+            const newest = dumps[0]?.at || null;
+            const oldest = dumps[retained - 1]?.at || null;
+            const spanDays = newest && oldest ? Math.max(0, Math.round((new Date(newest).getTime() - new Date(oldest).getTime()) / 8.64e7)) : 0;
+            const mounted = d.health?.dumps_mounted;
+            const thin = retained > 0 && retained < 3;
+            const chip = (ok: boolean, warn: boolean) => ok ? 'bg-green-100 text-green-700' : warn ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700';
+            return (
+              <section className="mb-8">
+                <h2 className="text-sm font-medium text-gray-700 mb-2">Backup policy &amp; offsite</h2>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="border rounded p-3"><div className="text-xs text-gray-500">Backups retained</div><div className="font-medium">{retained || '—'} {thin && <span className="text-amber-700 text-xs">(thin)</span>}</div></div>
+                  <div className="border rounded p-3"><div className="text-xs text-gray-500">History span</div><div className="font-medium">{retained ? `${spanDays} day${spanDays === 1 ? '' : 's'}` : '—'}</div></div>
+                  <div className="border rounded p-3"><div className="text-xs text-gray-500">Oldest retained</div><div className="font-medium">{fmt(oldest)}</div></div>
+                  <div className="border rounded p-3">
+                    <div className="text-xs text-gray-500">Offsite repository</div>
+                    <span className={`inline-block px-2 py-0.5 rounded text-xs ${chip(mounted === true, mounted == null)}`}>
+                      {mounted === true ? 'Mounted (Storage Box)' : mounted === false ? 'NOT MOUNTED' : 'unknown'}
+                    </span>
+                    {d.health?.disk_usage_pct != null && <div className="text-xs text-gray-400 mt-1">{d.health.disk_usage_pct}% used{d.health.disk_total_gb ? ` of ${d.health.disk_total_gb} GB` : ''}</div>}
+                  </div>
+                </div>
+                {(mounted === false || retained === 0 || thin) && (
+                  <ul className="mt-2 text-xs text-amber-700 list-disc pl-5">
+                    {mounted === false && <li><strong>Offsite repository is not mounted</strong> — new backups would write to local disk and silently fill it. Fix the bind-mount before relying on backups here.</li>}
+                    {retained === 0 && <li>No backups found in the repository for this server.</li>}
+                    {thin && <li>Only {retained} backup{retained === 1 ? '' : 's'} retained — a single bad backup leaves little to fall back to. Check the schedule/rotation.</li>}
+                  </ul>
+                )}
+              </section>
+            );
+          })()}
+
           {/* Dump repository history (live over SSH) */}
           <section>
             <h2 className="text-sm font-medium text-gray-700 mb-2">Backup history <span className="text-gray-400 font-normal">(Plesk repository, newest first)</span></h2>
