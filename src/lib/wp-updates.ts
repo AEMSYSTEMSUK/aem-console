@@ -1,6 +1,6 @@
 import { db } from '@/lib/db';
 import { sshExec } from '@/lib/ssh';
-import { lookupWpInstanceId, LIVE1, STAGING1, shellQ } from '@/lib/onboarding';
+import { lookupWpInstanceId, shellQ } from '@/lib/onboarding';
 
 export interface PendingCounts {
   plugins: number;
@@ -26,30 +26,39 @@ export interface WpUpdateJob {
   triggered_by_user_id: number | null;
 }
 
-function hostForServerId(server_id: number | null): string {
-  // Hardcoded for now; expand when more servers in the fleet.
-  if (server_id === 1) return STAGING1;
-  return LIVE1;
+// The server a site actually lives on, from the servers table. This used to be hard-coded (server 1 = staging1,
+// EVERYTHING else = live1), which sent scans/updates/rollbacks for mosohouse, embroideryinhouse, stag-sports and
+// tripaid sites over SSH to the wrong box. No fallback host: if we don't know where it lives, we don't touch it.
+async function hostForServerId(server_id: number | null): Promise<string> {
+  if (!server_id) throw new Error('Site has no host server recorded');
+  const r = await db.query<{ fqdn: string | null }>(`SELECT fqdn FROM servers WHERE id = $1`, [server_id]);
+  const fqdn = r.rows[0]?.fqdn;
+  if (!fqdn) throw new Error(`No FQDN recorded for server ${server_id}`);
+  return fqdn;
 }
 
-async function ensureInstanceId(siteId: number, host: string, domain: string): Promise<number | null> {
-  const cur = await db.query<{ wp_instance_id: number | null }>(
-    `SELECT wp_instance_id FROM sites WHERE id = $1`, [siteId]);
-  if (cur.rows[0]?.wp_instance_id) return cur.rows[0].wp_instance_id;
+// Resolve (host, WP Toolkit instance id) for a site, VERIFIED on the site's own server. A domain can exist on two
+// boxes (e.g. migrated staging1 -> live1), so a cached id is never trusted on its own: we ask that host's
+// wp-toolkit which instance serves https://<domain>. Discovery's raw.wp_instance_id (found on the right host) is
+// the fallback only if the live lookup can't run. The verified id is written back to sites.wp_instance_id.
+async function resolveTarget(siteId: number): Promise<{ domain: string; host: string; instId: number } | { error: string }> {
+  const s = await db.query<{ domain: string; host_server_id: number | null; raw: { wp_instance_id?: number } | null }>(
+    `SELECT domain, host_server_id, raw FROM sites WHERE id = $1 AND is_wordpress = true`, [siteId]);
+  if (s.rows.length === 0) return { error: 'Site not found or not WordPress' };
+  const { domain, host_server_id, raw } = s.rows[0];
+  let host: string;
+  try { host = await hostForServerId(host_server_id); } catch (e) { return { error: (e as Error).message }; }
   const lk = await lookupWpInstanceId(host, domain);
-  if (lk.id === null) return null;
-  await db.query(`UPDATE sites SET wp_instance_id = $1 WHERE id = $2`, [lk.id, siteId]);
-  return lk.id;
+  const instId = lk.id ?? (lk.error?.startsWith('No instance found') ? null : (raw?.wp_instance_id ? Number(raw.wp_instance_id) : null));
+  if (instId === null) return { error: `No WP Toolkit instance for ${domain} on ${host}${lk.error ? `: ${lk.error}` : ''}` };
+  await db.query(`UPDATE sites SET wp_instance_id = $1 WHERE id = $2`, [instId, siteId]);
+  return { domain, host, instId };
 }
 
 export async function scanSite(siteId: number): Promise<PendingCounts | null> {
-  const s = await db.query<{ domain: string; host_server_id: number | null }>(
-    `SELECT domain, host_server_id FROM sites WHERE id = $1 AND is_wordpress = true`, [siteId]);
-  if (s.rows.length === 0) return null;
-  const { domain, host_server_id } = s.rows[0];
-  const host = hostForServerId(host_server_id);
-  const instId = await ensureInstanceId(siteId, host, domain);
-  if (instId === null) return null;
+  const t = await resolveTarget(siteId);
+  if ('error' in t) return null;
+  const { host, instId } = t;
 
   const pluginsR = await sshExec(host,
     `plesk ext wp-toolkit --wp-cli -instance-id ${instId} -- plugin list --update=available --format=count 2>&1`, 30);
@@ -89,13 +98,9 @@ export async function triggerUpdate(
   kind: 'plugins' | 'themes' | 'core' | 'all',
   userId: number,
 ): Promise<{ jobId: number } | { error: string }> {
-  const s = await db.query<{ domain: string; host_server_id: number | null; wp_instance_id: number | null }>(
-    `SELECT domain, host_server_id, wp_instance_id FROM sites WHERE id = $1 AND is_wordpress = true`, [siteId]);
-  if (s.rows.length === 0) return { error: 'Site not found or not WordPress' };
-  const { domain, host_server_id } = s.rows[0];
-  const host = hostForServerId(host_server_id);
-  const instId = s.rows[0].wp_instance_id ?? await ensureInstanceId(siteId, host, domain);
-  if (instId === null) return { error: `Could not resolve wp-toolkit instance-id for ${domain}` };
+  const t = await resolveTarget(siteId);
+  if ('error' in t) return { error: t.error };
+  const { instId } = t;
 
   const j = await db.query<{ id: number }>(
     `INSERT INTO wp_update_jobs (site_id, instance_id, kind, status, progress_pct, triggered_by_user_id)
@@ -129,8 +134,8 @@ export async function runUpdateJob(jobId: number): Promise<void> {
        FROM wp_update_jobs j JOIN sites s ON s.id = j.site_id WHERE j.id = $1`, [jobId]);
   if (j.rows.length === 0) throw new Error('Job not found');
   const job = j.rows[0];
-  const host = hostForServerId(job.host_server_id);
-  const inst = job.instance_id;
+  const host = await hostForServerId(job.host_server_id);
+  const inst = job.instance_id; // verified on this host by resolveTarget when the job was created
 
   await setJob(jobId, { status: 'running', progress_pct: 10 });
 
@@ -194,7 +199,8 @@ export async function rollbackJob(jobId: number, userId: number): Promise<{ ok: 
   if (j.rows.length === 0) return { ok: false, error: 'Job not found' };
   const job = j.rows[0];
   if (!job.backup_filename) return { ok: false, error: 'No backup recorded for this job' };
-  const host = hostForServerId(job.host_server_id);
+  let host: string;
+  try { host = await hostForServerId(job.host_server_id); } catch (e) { return { ok: false, error: (e as Error).message }; }
 
   const r = await sshExec(host,
     `plesk ext wp-toolkit --backup -instance-id ${job.instance_id} -operation restore -filename ${shellQ(job.backup_filename)} 2>&1`,
