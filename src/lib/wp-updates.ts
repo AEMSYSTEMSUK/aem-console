@@ -1,6 +1,7 @@
 import { db } from '@/lib/db';
 import { sshExec } from '@/lib/ssh';
 import { lookupWpInstanceId, shellQ } from '@/lib/onboarding';
+import type { PendingItem } from '@/lib/wp-patch-policy';
 
 export interface PendingCounts {
   plugins: number;
@@ -55,42 +56,158 @@ async function resolveTarget(siteId: number): Promise<{ domain: string; host: st
   return { domain, host, instId };
 }
 
+// wp-toolkit sometimes prints PHP notices/warnings before (or after) wp-cli's JSON. wp-cli emits its JSON on one
+// line, so try each line that looks like JSON first, then fall back to scanning from each '[' / '{'.
+function parseJsonLoose(out: string): unknown {
+  const s = out || '';
+  for (const line of s.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('[') || t.startsWith('{')) { try { return JSON.parse(t); } catch {} }
+  }
+  for (let i = 0, tries = 0; i < s.length && tries < 50; i++) {
+    const ch = s[i];
+    if (ch !== '[' && ch !== '{') continue;
+    tries++;
+    const end = s.lastIndexOf(ch === '[' ? ']' : '}');
+    if (end <= i) continue;
+    try { return JSON.parse(s.slice(i, end + 1)); } catch {}
+  }
+  return undefined;
+}
+
+const str = (v: unknown): string | null => (v === null || v === undefined || v === '' ? null : String(v));
+
+function toItems(kind: 'plugin' | 'theme', parsed: unknown[]): PendingItem[] {
+  return parsed
+    .filter((r: any) => r && r.name)
+    .map((r: any) => ({ kind, slug: String(r.name), name: str(r.title) ?? String(r.name),
+                        current_version: str(r.version), new_version: str(r.update_version) }));
+}
+
+const snip = (r: { stdout: string; stderr: string; error?: string }) =>
+  (r.stderr || r.error || r.stdout || '(no output)').trim().slice(0, 300);
+
+// Itemised scan: which plugin/theme/core updates are available on one site. Replaces that site's rows in
+// wp_pending_updates and keeps the sites.pending_* count columns in step (the updates table reads those).
+// Returns null if the site can't be resolved to a host + instance; THROWS if wp-cli output can't be read, so a
+// broken scan never overwrites good data with zeros.
 export async function scanSite(siteId: number): Promise<PendingCounts | null> {
   const t = await resolveTarget(siteId);
   if ('error' in t) return null;
   const { host, instId } = t;
+  const wpcli = `plesk ext wp-toolkit --wp-cli -instance-id ${instId} --`;
 
-  const pluginsR = await sshExec(host,
-    `plesk ext wp-toolkit --wp-cli -instance-id ${instId} -- plugin list --update=available --format=count 2>&1`, 30);
-  const themesR = await sshExec(host,
-    `plesk ext wp-toolkit --wp-cli -instance-id ${instId} -- theme list --update=available --format=count 2>&1`, 30);
-  const coreR = await sshExec(host,
-    `plesk ext wp-toolkit --wp-cli -instance-id ${instId} -- core check-update --format=count 2>&1`, 30);
+  const pluginsR = await sshExec(host, `${wpcli} plugin list --update=available --format=json --fields=name,title,version,update_version`, 60);
+  const themesR  = await sshExec(host, `${wpcli} theme list --update=available --format=json --fields=name,title,version,update_version`, 60);
+  const coreR    = await sshExec(host, `${wpcli} core check-update --format=json`, 60);
 
-  const plugins = parseInt((pluginsR.stdout || '').trim().match(/^\d+/)?.[0] || '0', 10);
-  const themes  = parseInt((themesR.stdout  || '').trim().match(/^\d+/)?.[0] || '0', 10);
-  const core    = !/at the latest version/.test(coreR.stdout || '') && parseInt((coreR.stdout || '').trim().match(/^\d+/)?.[0] || '0', 10) > 0;
+  const pluginsJ = parseJsonLoose(pluginsR.stdout);
+  const themesJ  = parseJsonLoose(themesR.stdout);
+  if (!Array.isArray(pluginsJ)) throw new Error(`plugin list unreadable: ${snip(pluginsR)}`);
+  if (!Array.isArray(themesJ))  throw new Error(`theme list unreadable: ${snip(themesR)}`);
 
-  await db.query(
-    `UPDATE sites
-       SET pending_plugin_updates = $1,
-           pending_theme_updates  = $2,
-           pending_core_update    = $3,
-           last_update_scan_at    = NOW()
-     WHERE id = $4`,
-    [plugins, themes, core, siteId]);
+  // core check-update prints "Success: WordPress is at the latest version." (no JSON) when there's nothing to do,
+  // otherwise a JSON array of {version, update_type, package_url}, newest first. One core row: the newest.
+  let coreItems: PendingItem[] = [];
+  if (!/at the latest version/i.test(`${coreR.stdout}\n${coreR.stderr}`)) {
+    const coreJ = parseJsonLoose(coreR.stdout);
+    if (!Array.isArray(coreJ)) throw new Error(`core check-update unreadable: ${snip(coreR)}`);
+    const newest = coreJ.find((c: any) => c && c.version) as { version: unknown } | undefined;
+    if (newest) {
+      // Current version (needed to tell a core major from a minor). Fall back to inventory's wp_version.
+      const verR = await sshExec(host, `${wpcli} core version`, 30);
+      const live = (verR.stdout || '').split('\n').map(l => l.trim()).reverse().find(l => /^\d+\.\d+/.test(l)) ?? null;
+      const inv = live ? null : (await db.query<{ wp_version: string | null }>(
+        `SELECT wp_version FROM sites WHERE id = $1`, [siteId])).rows[0]?.wp_version ?? null;
+      coreItems = [{ kind: 'core', slug: 'wordpress', name: 'WordPress', current_version: live ?? inv, new_version: String(newest.version) }];
+    }
+  }
 
-  return { plugins, themes, core, scanned_at: new Date() };
+  const pluginItems = toItems('plugin', pluginsJ);
+  const themeItems  = toItems('theme', themesJ);
+  const items = [...pluginItems, ...themeItems, ...coreItems];
+  const counts = { plugins: pluginItems.length, themes: themeItems.length, core: coreItems.length > 0 };
+
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM wp_pending_updates WHERE site_id = $1`, [siteId]);
+    for (const it of items) {
+      await client.query(
+        `INSERT INTO wp_pending_updates (site_id, kind, slug, name, current_version, new_version)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (site_id, kind, slug) DO NOTHING`,
+        [siteId, it.kind, it.slug, it.name, it.current_version, it.new_version]);
+    }
+    await client.query(
+      `UPDATE sites
+         SET pending_plugin_updates = $1,
+             pending_theme_updates  = $2,
+             pending_core_update    = $3,
+             last_update_scan_at    = NOW()
+       WHERE id = $4`,
+      [counts.plugins, counts.themes, counts.core, siteId]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  return { ...counts, scanned_at: new Date() };
 }
 
-export async function scanFleet(): Promise<{ scanned: number; failed: number }> {
-  const sites = await db.query<{ id: number }>(
-    `SELECT id FROM sites WHERE is_wordpress = true ORDER BY id`);
-  let scanned = 0, failed = 0;
+// A job left 'pending'/'running' means the Console process died mid-job (runUpdateJob runs in-process and never
+// resumes). Nothing legitimately runs that long (backup 10 min + 3 x update 10 min worst case), so after 2 hours
+// mark it failed so the UI stops showing it as in progress.
+export async function sweepOrphanedUpdateJobs(): Promise<number> {
+  const r = await db.query(
+    `UPDATE wp_update_jobs
+        SET status = 'failed', error = 'Orphaned (Console restarted mid-job)', completed_at = NOW()
+      WHERE status IN ('running', 'pending') AND started_at < NOW() - INTERVAL '2 hours'`);
+  return r.rowCount ?? 0;
+}
+
+export interface FleetScanResult {
+  sites: number; servers: number; scanned: number; failed: number;
+  plugins: number; themes: number; core: number; orphaned: number;
+}
+
+const SCAN_CONCURRENCY_PER_SERVER = 2;
+
+// Scan every WP site: servers in parallel, at most SCAN_CONCURRENCY_PER_SERVER sites at once on any one server.
+export async function scanFleet(): Promise<FleetScanResult> {
+  const orphaned = await sweepOrphanedUpdateJobs();
+  const sites = await db.query<{ id: number; host_server_id: number | null }>(
+    `SELECT id, host_server_id FROM sites WHERE is_wordpress = true ORDER BY id`);
+  const byServer = new Map<string, number[]>();
   for (const s of sites.rows) {
-    try { await scanSite(s.id); scanned++; } catch { failed++; }
+    const k = String(s.host_server_id ?? 'none');
+    const list = byServer.get(k) ?? [];
+    list.push(s.id);
+    byServer.set(k, list);
   }
-  return { scanned, failed };
+  const res: FleetScanResult = { sites: sites.rows.length, servers: byServer.size, scanned: 0, failed: 0, plugins: 0, themes: 0, core: 0, orphaned };
+
+  await Promise.all([...byServer.values()].map(async (ids) => {
+    let next = 0;
+    const worker = async () => {
+      while (next < ids.length) {
+        const id = ids[next++];
+        try {
+          const r = await scanSite(id);
+          if (!r) { res.failed++; continue; }
+          res.scanned++; res.plugins += r.plugins; res.themes += r.themes; if (r.core) res.core++;
+        } catch (e) {
+          res.failed++;
+          console.error(`wp update scan failed for site ${id}:`, (e as Error)?.message ?? e);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SCAN_CONCURRENCY_PER_SERVER, ids.length) }, () => worker()));
+  }));
+  return res;
 }
 
 export async function triggerUpdate(

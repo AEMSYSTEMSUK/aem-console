@@ -11,6 +11,7 @@
 !/src/
 !/public/
 !/migrations/
+!/docs/
 !/package.json
 !/package-lock.json
 !/next.config.ts
