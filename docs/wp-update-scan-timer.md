@@ -2,13 +2,14 @@
 
 Runs the itemised WP update scan (`POST /api/cron/wp-update-scan-system`) every night at **03:15 UTC**.
 The scan fills `wp_pending_updates`, refreshes the `sites.pending_*` counts shown on `/updates`, and first
-sweeps update jobs orphaned by a Console restart (stuck `pending`/`running` > 2 h -> `failed`).
+sweeps update jobs orphaned by a Console restart (stuck `pending`/`running` > 2 h -> `failed`). After the scan it
+runs the #220 security fast-track check (see `wp-patch-timers.md`); its result is the `fasttrack` key in the response.
 
 Same pattern as the other `aem-console-*` timers (e.g. `aem-console-cve-refresh`): a root oneshot that reads
 `AEM_CRON_SECRET` from `/etc/aem-console/config.env` at run time and curls the route. No secret is stored in
 the unit files. 03:15 sits after the 03:00 CVE refresh.
 
-Install once on the bastion (`root@77.68.51.230`), **after** the Console deploy that ships the route and the
+Install once on the bastion (`root@217.154.59.240`), **after** the Console deploy that ships the route and the
 `wp_pending_updates` migration. Paste one command at a time.
 
 ```bash

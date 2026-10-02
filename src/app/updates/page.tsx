@@ -43,6 +43,7 @@ export default async function UpdatesPage() {
     itemsBySite.set(it.site_id, list);
   }
   const policies = await getAllPolicies();
+  const awaiting = await db.query<{ n: number }>(`SELECT COUNT(*)::int AS n FROM wp_patch_sites WHERE state = 'awaiting_approval'`);
 
   return (
     <main style={{ maxWidth: 1180, margin: '2rem auto', padding: '0 1rem', fontFamily: 'system-ui' }}>
@@ -50,6 +51,9 @@ export default async function UpdatesPage() {
         <h1 style={{ fontSize: '1.5rem', margin: 0 }}>WordPress updates</h1>
         <div style={{ display: 'flex', gap: '.5rem', alignItems: 'center' }}>
           <span style={{ color: '#666', fontSize: '.85rem' }}>{rs.rows.length} WP sites</span>
+          <a href="/updates/runs" style={{ fontSize: '.85rem', color: '#1976d2' }}>
+            Patch runs{awaiting.rows[0]?.n ? ` (${awaiting.rows[0].n} awaiting approval)` : ''}
+          </a>
           {me.role === 'admin' && <ScanAllButton />}
         </div>
       </header>

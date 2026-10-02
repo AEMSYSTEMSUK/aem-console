@@ -1,7 +1,7 @@
 import { db } from '@/lib/db';
 
-// #220 — per-site WordPress patch policy (wp_patch_policies). Phase 1 only stores and displays it; the phase 2
-// staged-patching engine will consume it. A site with no row gets DEFAULT_POLICY (approve / standard ring).
+// #220 — per-site WordPress patch policy (wp_patch_policies), consumed by the phase 2 staged-patching engine
+// (src/lib/wp-patch/). A site with no row gets DEFAULT_POLICY (approve / standard ring).
 
 export type PatchMode = 'auto' | 'approve' | 'report';
 export type PatchRing = 'pilot' | 'flagship' | 'standard';
@@ -18,6 +18,7 @@ export interface PatchPolicy {
   smoke_paths: string[];
   expect_text: string | null;
   is_woocommerce: boolean;
+  client_approval: boolean; // opt-in: everything needs approval (recorded only, no client UI yet)
   notes: string | null;
   updated_at: string | null;
   is_default: boolean;   // true = no row saved yet, these are the defaults
@@ -34,13 +35,13 @@ export interface PendingItem {
 export function defaultPolicy(siteId: number): PatchPolicy {
   return {
     site_id: siteId, enabled: true, mode: 'approve', ring: 'standard', exclude_slugs: [],
-    hold_core_major: true, smoke_paths: ['/'], expect_text: null, is_woocommerce: false, notes: null,
+    hold_core_major: true, smoke_paths: ['/'], expect_text: null, is_woocommerce: false, client_approval: false, notes: null,
     updated_at: null, is_default: true,
   };
 }
 
 const POLICY_COLS = `site_id, enabled, mode, ring, exclude_slugs, hold_core_major, smoke_paths, expect_text,
-                     is_woocommerce, notes, updated_at::text`;
+                     is_woocommerce, client_approval, notes, updated_at::text`;
 
 export async function getPolicy(siteId: number): Promise<PatchPolicy> {
   const r = await db.query<Omit<PatchPolicy, 'is_default'>>(
@@ -104,6 +105,7 @@ export function parsePolicyInput(body: any): { value: PolicyInput } | { error: s
       smoke_paths: smoke.length ? smoke : ['/'],
       expect_text: optText(body?.expect_text, 500),
       is_woocommerce: body?.is_woocommerce === true,
+      client_approval: body?.client_approval === true,
       notes: optText(body?.notes, 4000),
     },
   };
@@ -112,13 +114,15 @@ export function parsePolicyInput(body: any): { value: PolicyInput } | { error: s
 export async function savePolicy(siteId: number, p: PolicyInput): Promise<void> {
   await db.query(
     `INSERT INTO wp_patch_policies
-       (site_id, enabled, mode, ring, exclude_slugs, hold_core_major, smoke_paths, expect_text, is_woocommerce, notes, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+       (site_id, enabled, mode, ring, exclude_slugs, hold_core_major, smoke_paths, expect_text, is_woocommerce, notes,
+        client_approval, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
      ON CONFLICT (site_id) DO UPDATE SET
        enabled = EXCLUDED.enabled, mode = EXCLUDED.mode, ring = EXCLUDED.ring,
        exclude_slugs = EXCLUDED.exclude_slugs, hold_core_major = EXCLUDED.hold_core_major,
        smoke_paths = EXCLUDED.smoke_paths, expect_text = EXCLUDED.expect_text,
-       is_woocommerce = EXCLUDED.is_woocommerce, notes = EXCLUDED.notes, updated_at = NOW()`,
+       is_woocommerce = EXCLUDED.is_woocommerce, notes = EXCLUDED.notes,
+       client_approval = EXCLUDED.client_approval, updated_at = NOW()`,
     [siteId, p.enabled, p.mode, p.ring, p.exclude_slugs, p.hold_core_major, p.smoke_paths, p.expect_text,
-     p.is_woocommerce, p.notes]);
+     p.is_woocommerce, p.notes, p.client_approval]);
 }

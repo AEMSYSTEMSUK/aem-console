@@ -38,14 +38,14 @@ export default async function PatchPolicyPage({ params }: { params: Promise<{ si
         {site.domain} · {policy.is_default ? 'defaults (not saved yet)' : `last saved ${policy.updated_at ? new Date(policy.updated_at).toLocaleString() : ''}`}
       </p>
       <p style={{ color: '#888', fontSize: '.8rem' }}>
-        Stored for the staged-patching engine (#220 phase 2). Today it only marks pending items as held on the updates page;
-        nothing is patched automatically.
+        Used by the staged-patching engine (#220): Monday 06:00 staging run, Tuesday 06:00 live run, same-day fast-track for
+        security fixes. Held items (excluded slugs, held core majors) are never applied. See <a href="/updates/runs">patch runs</a>.
       </p>
       <div style={{ display: 'flex', gap: '2rem', alignItems: 'flex-start', flexWrap: 'wrap' }}>
         <PolicyForm siteId={sid} initial={{
           enabled: policy.enabled, mode: policy.mode, ring: policy.ring, exclude_slugs: policy.exclude_slugs,
           hold_core_major: policy.hold_core_major, smoke_paths: policy.smoke_paths, expect_text: policy.expect_text,
-          is_woocommerce: policy.is_woocommerce, notes: policy.notes,
+          is_woocommerce: policy.is_woocommerce, client_approval: policy.client_approval, notes: policy.notes,
         }} />
         <section style={{ flex: 1, minWidth: 280 }}>
           <h2 style={{ fontSize: '1rem', marginTop: 0 }}>Pending updates ({items.rows.length})</h2>

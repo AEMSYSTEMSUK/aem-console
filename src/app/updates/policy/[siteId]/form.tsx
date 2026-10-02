@@ -11,6 +11,7 @@ export interface PolicyFormValue {
   smoke_paths: string[];
   expect_text: string | null;
   is_woocommerce: boolean;
+  client_approval: boolean;
   notes: string | null;
 }
 
@@ -29,6 +30,7 @@ export function PolicyForm({ siteId, initial }: { siteId: number; initial: Polic
   const [smoke, setSmoke] = useState(initial.smoke_paths.join('\n'));
   const [expectText, setExpectText] = useState(initial.expect_text ?? '');
   const [isWoo, setIsWoo] = useState(initial.is_woocommerce);
+  const [clientApproval, setClientApproval] = useState(initial.client_approval);
   const [notes, setNotes] = useState(initial.notes ?? '');
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -40,7 +42,7 @@ export function PolicyForm({ siteId, initial }: { siteId: number; initial: Polic
       const r = await fetch(`/api/sites/${siteId}/patch-policy`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          enabled, mode, ring, hold_core_major: holdCoreMajor, is_woocommerce: isWoo,
+          enabled, mode, ring, hold_core_major: holdCoreMajor, is_woocommerce: isWoo, client_approval: clientApproval,
           exclude_slugs: exclude.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
           smoke_paths: smoke.split(/[\n,]/).map(s => s.trim()).filter(Boolean),
           expect_text: expectText, notes,
@@ -65,7 +67,7 @@ export function PolicyForm({ siteId, initial }: { siteId: number; initial: Polic
         <label style={label}>Mode</label>
         <select value={mode} onChange={e => setMode(e.target.value as PolicyFormValue['mode'])} style={input}>
           <option value="approve">approve: stage and test, wait for sign-off before live</option>
-          <option value="auto">auto: promote to live automatically if the staging tests pass</option>
+          <option value="auto">auto: minor/patch + security go live automatically after staging passes; majors need staff approval</option>
           <option value="report">report: scan and report only, never patch</option>
         </select>
       </div>
@@ -101,6 +103,12 @@ export function PolicyForm({ siteId, initial }: { siteId: number; initial: Polic
         <label style={{ display: 'flex', gap: '.5rem', alignItems: 'center' }}>
           <input type="checkbox" checked={isWoo} onChange={e => setIsWoo(e.target.checked)} />
           <span style={{ fontWeight: 600, fontSize: '.85rem' }}>WooCommerce store (live orders: sync code only, never the database)</span>
+        </label>
+      </div>
+      <div style={field}>
+        <label style={{ display: 'flex', gap: '.5rem', alignItems: 'center' }}>
+          <input type="checkbox" checked={clientApproval} onChange={e => setClientApproval(e.target.checked)} />
+          <span style={{ fontWeight: 600, fontSize: '.85rem' }}>Client approval required (every update waits for sign-off, even in auto mode)</span>
         </label>
       </div>
       <div style={field}>

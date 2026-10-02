@@ -30,7 +30,7 @@ export interface WpUpdateJob {
 // The server a site actually lives on, from the servers table. This used to be hard-coded (server 1 = staging1,
 // EVERYTHING else = live1), which sent scans/updates/rollbacks for mosohouse, embroideryinhouse, stag-sports and
 // tripaid sites over SSH to the wrong box. No fallback host: if we don't know where it lives, we don't touch it.
-async function hostForServerId(server_id: number | null): Promise<string> {
+export async function hostForServerId(server_id: number | null): Promise<string> {
   if (!server_id) throw new Error('Site has no host server recorded');
   const r = await db.query<{ fqdn: string | null }>(`SELECT fqdn FROM servers WHERE id = $1`, [server_id]);
   const fqdn = r.rows[0]?.fqdn;
@@ -42,7 +42,7 @@ async function hostForServerId(server_id: number | null): Promise<string> {
 // boxes (e.g. migrated staging1 -> live1), so a cached id is never trusted on its own: we ask that host's
 // wp-toolkit which instance serves https://<domain>. Discovery's raw.wp_instance_id (found on the right host) is
 // the fallback only if the live lookup can't run. The verified id is written back to sites.wp_instance_id.
-async function resolveTarget(siteId: number): Promise<{ domain: string; host: string; instId: number } | { error: string }> {
+export async function resolveTarget(siteId: number): Promise<{ domain: string; host: string; instId: number } | { error: string }> {
   const s = await db.query<{ domain: string; host_server_id: number | null; raw: { wp_instance_id?: number } | null }>(
     `SELECT domain, host_server_id, raw FROM sites WHERE id = $1 AND is_wordpress = true`, [siteId]);
   if (s.rows.length === 0) return { error: 'Site not found or not WordPress' };
@@ -58,7 +58,7 @@ async function resolveTarget(siteId: number): Promise<{ domain: string; host: st
 
 // wp-toolkit sometimes prints PHP notices/warnings before (or after) wp-cli's JSON. wp-cli emits its JSON on one
 // line, so try each line that looks like JSON first, then fall back to scanning from each '[' / '{'.
-function parseJsonLoose(out: string): unknown {
+export function parseJsonLoose(out: string): unknown {
   const s = out || '';
   for (const line of s.split('\n')) {
     const t = line.trim();
@@ -93,7 +93,11 @@ const snip = (r: { stdout: string; stderr: string; error?: string }) =>
 // broken scan never overwrites good data with zeros.
 export async function scanSite(siteId: number): Promise<PendingCounts | null> {
   const t = await resolveTarget(siteId);
-  if ('error' in t) return null;
+  if ('error' in t) {
+    // Logged so the nightly scan's "failed" count can be traced to sites (wrong server, no WP Toolkit instance...).
+    console.error(`wp update scan failed for site ${siteId}: ${t.error}`);
+    return null;
+  }
   const { host, instId } = t;
   const wpcli = `plesk ext wp-toolkit --wp-cli -instance-id ${instId} --`;
 
