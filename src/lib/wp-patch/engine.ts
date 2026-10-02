@@ -31,6 +31,9 @@ import {
 // policy for every other WP site is approve/enabled, which would otherwise clone the whole fleet on the first
 // Monday). Flip to false once the pilot ring has run cleanly.
 export const REQUIRE_SAVED_POLICY = true;
+// Automatic security fast-track after the nightly scan. OFF until the pilot sites have been through a manual
+// staging + live run (2 Oct 2026) - fast-track can take an auto-mode site live without anyone watching.
+export const FASTTRACK_AFTER_SCAN = false;
 
 const STAGE_FRESH_HOURS = 24;     // an open staged row younger than this is not re-staged
 const LIVE_WINDOW_DAYS = 8;       // approved rows older than this aren't promoted (re-staged next Monday)

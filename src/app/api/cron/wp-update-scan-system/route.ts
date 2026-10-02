@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scanFleet, sweepOrphanedUpdateJobs } from '@/lib/wp-updates';
-import { startFastTrack, sweepOrphanedPatchSites } from '@/lib/wp-patch/engine';
+import { startFastTrack, sweepOrphanedPatchSites, FASTTRACK_AFTER_SCAN } from '@/lib/wp-patch/engine';
 
 // #220 — nightly itemised WP update scan (aem-console-wp-update-scan.timer). Synchronous: the timer's curl waits
 // for the whole fleet scan and logs the counts to the journal. After the scan it runs the #220 security fast-track
@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
   let fasttrack: unknown;
   try {
     const patchOrphans = await sweepOrphanedPatchSites();
-    const ft = await startFastTrack('scan');
+    const ft = FASTTRACK_AFTER_SCAN ? await startFastTrack('scan') : { ok: true, runId: null, reason: 'fast-track disabled (FASTTRACK_AFTER_SCAN)' };
     fasttrack = { ...ft, patchOrphans };
   } catch (e) {
     fasttrack = { ok: false, error: (e as Error)?.message ?? String(e) };
