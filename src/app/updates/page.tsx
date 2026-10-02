@@ -95,7 +95,9 @@ export default async function UpdatesPage() {
               <td style={{ padding: '.5rem' }}>
                 <div style={{ display: 'flex', gap: '.25rem' }}>
                   <ScanOneButton siteId={s.id} />
-                  {me.role === 'admin' && <UpdateButton siteId={s.id} domain={s.domain} />}
+                  {me.role === 'admin' && (!policy.is_default && policy.enabled && policy.mode !== 'report'
+                  ? <a href="/updates/runs" style={{ fontSize: '.75rem', color: '#1976d2' }} title="On staged patching - patched via staging + approval">staged</a>
+                  : <UpdateButton siteId={s.id} domain={s.domain} />)}
                 </div>
               </td>
             </tr>
