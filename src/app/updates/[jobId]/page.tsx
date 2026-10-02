@@ -36,7 +36,8 @@ export default async function JobPage({ params }: { params: Promise<{ jobId: str
         )}
       </div>
       <div style={{ color: '#888', fontSize: '.8rem', marginBottom: '1rem' }}>
-        Started: {job.started_at} {job.completed_at ? `· Completed: ${job.completed_at}` : ''} · Backup: {job.backup_filename ?? '(none yet)'}
+        {/* pg returns timestamptz as Date objects - React can't render those directly */}
+        Started: {job.started_at ? new Date(job.started_at).toLocaleString() : '-'} {job.completed_at ? `· Completed: ${new Date(job.completed_at).toLocaleString()}` : ''} · Backup: {job.backup_filename ?? '(none yet)'}
       </div>
       {job.error && <pre style={{ background: '#fee', padding: '.75rem', color: '#a00', fontSize: '.8rem', whiteSpace: 'pre-wrap' }}>{job.error}</pre>}
       {job.output && <pre style={{ background: '#f8f8f8', padding: '.75rem', fontSize: '.75rem', whiteSpace: 'pre-wrap', maxHeight: 400, overflow: 'auto' }}>{job.output}</pre>}
