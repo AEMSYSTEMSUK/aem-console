@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { requireAdmin, HttpError } from '@/lib/rbac';
+import { requireUser, requireAdmin, HttpError } from '@/lib/rbac';
 
 // Admin-only: delete a wizard record (its onboarding_steps cascade). Used to clear
 // abandoned drafts and pick-winner losers from the /onboarding list once their
@@ -24,6 +24,7 @@ export async function DELETE(_req: NextRequest, ctx: { params: Promise<{ id: str
 }
 
 export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
+  try { await requireUser(); } catch (e) { return NextResponse.json({ error: (e as Error)?.message || 'Unauthorized' }, { status: (e as { status?: number })?.status || 401 }); }
   const { id } = await ctx.params;
   const wid = parseInt(id, 10);
   if (!Number.isFinite(wid)) return NextResponse.json({ error: 'bad id' }, { status: 400 });

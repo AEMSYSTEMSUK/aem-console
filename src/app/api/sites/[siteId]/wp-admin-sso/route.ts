@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { requireUser } from '@/lib/rbac';
 import { createHmac } from 'crypto';
 import { readFileSync } from 'fs';
 import { db } from '@/lib/db';
 
 export async function POST(_req: NextRequest, ctx: { params: Promise<{ siteId: string }> }) {
+  try { await requireUser(); } catch (e) { return NextResponse.json({ error: (e as Error)?.message || 'Unauthorized' }, { status: (e as { status?: number })?.status || 401 }); }
   const { siteId: id } = await ctx.params;
   const sid = parseInt(id, 10);
   if (!Number.isFinite(sid)) return NextResponse.json({ error: 'bad id' }, { status: 400 });
